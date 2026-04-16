@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+from pathlib import Path
 
 
 def _parse_args() -> argparse.Namespace:
@@ -75,6 +77,11 @@ def main() -> int:
     kwargs: dict = {"debug": args.debug}
     if args.storage_state_path:
         kwargs["storage_state_path"] = args.storage_state_path
+    elif not os.getenv("LINKEDIN_STORAGE_PATH"):
+        # Local default: fixed path in this repo.
+        # In production, LINKEDIN_STORAGE_PATH should point to Railway volume.
+        local_default = Path(__file__).resolve().parent / "data" / "linkedin_storage.json"
+        kwargs["storage_state_path"] = str(local_default)
 
     results = run_outreach_batch_sync(items, **kwargs)
 

@@ -162,6 +162,54 @@ def _detect_degree_from_page(driver: uc.Chrome) -> dict[str, Any]:
     }
 
 
+def _detect_pending_connection_request(driver: uc.Chrome) -> bool:
+    """
+    Detect whether a connection request is already pending.
+
+    LinkedIn shows a visible 'Pending' control near the top-card CTAs for profiles
+    where an invite was already sent.
+    """
+    js = """
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const norm = (t) => (t || '').replace(/\\s+/g,' ').trim().toLowerCase();
+        const main = document.querySelector('main') || document;
+        // Prefer top-card / CTA containers; avoid sidebar cards.
+        const roots = Array.from(
+            main.querySelectorAll(
+                '.pv-top-card-v2-ctas, .pv-top-card-v2-section__container, .ph5.pb5, .mt2.relative, main section'
+            )
+        );
+        roots.unshift(main);
+        const seen = new WeakSet();
+        for (const root of roots) {
+            const nodes = Array.from(root.querySelectorAll('button, a[role=\"button\"], div[role=\"button\"], span'))
+                .filter(isVisible);
+            for (const el of nodes) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                const txt = norm(el.innerText || el.textContent);
+                const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+                const title = norm(el.getAttribute && el.getAttribute('title'));
+                // "Pending" is typically the button text itself.
+                if (txt === 'pending' || aria.includes('pending') || title === 'pending') {
+                    // Ensure it's in the main/top-card region, not "More profiles" list.
+                    if (el.closest('.pv-top-card-v2-ctas, .pv-top-card-v2-section__container, main')) return true;
+                }
+            }
+        }
+        return false;
+    """
+    try:
+        return bool(driver.execute_script(js))
+    except Exception:
+        return False
+
+
 def _new_profile_result(profile_url: str) -> dict[str, Any]:
     return {
         "profile_url": profile_url,
@@ -170,6 +218,7 @@ def _new_profile_result(profile_url: str) -> dict[str, Any]:
         "action_taken": "skipped",
         "success": False,
         "step_succeeded": None,
+        "skip_reason": None,
         "error": None,
     }
 
@@ -202,6 +251,10 @@ def _execute_profile_action(
     timeout_s: int,
     debug: bool,
 ) -> tuple[str, bool, dict[str, Any]]:
+    # For 2nd/3rd-degree profiles, skip if invite already pending.
+    if bucket == "2nd_or_3rd" and _detect_pending_connection_request(driver):
+        return "skipped", True, {"skip_reason": "already_pending"}
+
     if bucket == "1st":
         details = _send_message_with_driver(
             driver,
@@ -310,12 +363,22 @@ def run_outreach_batch_sync(
                 entry["success"] = success
                 entry["step_succeeded"] = action if success else None
                 if action == "skipped":
-                    entry["error"] = f"unknown connection degree: {degree_info.get('connection_degree')}"
-                    logger.error(
-                        "outreach profile failed url=%s step=route_action err=%s",
-                        profile_url,
-                        entry["error"],
-                    )
+                    skip_reason = None
+                    if isinstance(details, dict):
+                        skip_reason = details.get("skip_reason")
+                    entry["skip_reason"] = skip_reason
+                    if skip_reason == "already_pending":
+                        logger.info(
+                            "outreach profile step=route_action status=skipped url=%s reason=already_pending",
+                            profile_url,
+                        )
+                    else:
+                        entry["error"] = f"unknown connection degree: {degree_info.get('connection_degree')}"
+                        logger.error(
+                            "outreach profile failed url=%s step=route_action err=%s",
+                            profile_url,
+                            entry["error"],
+                        )
                 elif success:
                     logger.info(
                         "outreach profile step=%s status=success url=%s",
@@ -333,7 +396,11 @@ def run_outreach_batch_sync(
                 if debug:
                     entry["details"] = details
                 else:
-                    compact = _compact_action_details(details, action)
+                    if action == "skipped" and isinstance(details, dict) and details.get("skip_reason"):
+                        entry["details"] = {"skip_reason": details.get("skip_reason")}
+                        compact = {}
+                    else:
+                        compact = _compact_action_details(details, action)
                     if compact:
                         entry["details"] = compact
 
