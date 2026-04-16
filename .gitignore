@@ -1,0 +1,32 @@
+# Python caches/build
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment/config secrets
+.env
+.env.*
+
+# Local runtime artifacts
+debug_output/
+*.log
+
+# LinkedIn session secrets
+data/longin_storage.json
+data/linkedin_storage.json
+
+# IDE/editor
+.idea/
+.vscode/
+.DS_Store

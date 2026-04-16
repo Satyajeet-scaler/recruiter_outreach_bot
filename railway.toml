@@ -1,0 +1,17 @@
+# Railway config (same deployment pattern as job_scaper).
+# Required env vars:
+#   INTERNAL_TRIGGER_TOKEN       - required for /internal/* endpoints
+#   LINKEDIN_STORAGE_PATH        - optional, defaults from code
+#   APP_LOG_LEVEL                - optional (INFO/DEBUG/...)
+#
+# Optional recommendation for persistent LinkedIn session:
+#   Mount a Railway volume at /data and set:
+#   LINKEDIN_STORAGE_PATH=/data/longin_storage.json
+
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
