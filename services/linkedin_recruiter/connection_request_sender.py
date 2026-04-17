@@ -1321,6 +1321,46 @@ def _classify_post_connect_state(driver: uc.Chrome) -> dict[str, Any]:
         return {"state": "unknown", "confidence": "low", "error": str(exc)}
 
 
+def _detect_pending_connection_request(driver: uc.Chrome) -> bool:
+    """Detect whether a visible Pending control is present in profile top actions."""
+    js = """
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const norm = (t) => (t || '').replace(/\\s+/g,' ').trim().toLowerCase();
+        const main = document.querySelector('main') || document;
+        const roots = Array.from(
+            main.querySelectorAll(
+                '.pv-top-card-v2-ctas, .pv-top-card-v2-section__container, .ph5.pb5, .mt2.relative, main section'
+            )
+        );
+        roots.unshift(main);
+        const seen = new WeakSet();
+        for (const root of roots) {
+            const nodes = Array.from(root.querySelectorAll('button, a[role=\"button\"], div[role=\"button\"], span'))
+                .filter(isVisible);
+            for (const el of nodes) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                const txt = norm(el.innerText || el.textContent);
+                const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+                const title = norm(el.getAttribute && el.getAttribute('title'));
+                if (txt === 'pending' || aria.includes('pending') || title === 'pending') {
+                    if (el.closest('.pv-top-card-v2-ctas, .pv-top-card-v2-section__container, main')) return true;
+                }
+            }
+        }
+        return false;
+    """
+    try:
+        return bool(driver.execute_script(js))
+    except Exception:
+        return False
+
+
 def _detect_interaction_blockers(driver: uc.Chrome) -> dict[str, Any]:
     """Detect common LinkedIn UI states that block interaction/clicking."""
     js = """
@@ -1822,6 +1862,8 @@ def _send_connection_request_with_driver(
         "add_note_clicked": False,
         "send_clicked": False,
         "note_text": note_text,
+        "pending_detected_after_connect": False,
+        "connect_attempts": 0,
     }
 
     driver.get(profile_url)
@@ -1829,20 +1871,43 @@ def _send_connection_request_with_driver(
     _human_pause(1.2, 2.8, label="after_profile_load")
     logger.info("landed url=%s title=%s", driver.current_url, driver.title)
 
-    clicked, source = _click_profile_connect_button(driver, timeout_s=timeout_s)
+    clicked = False
+    source: str | None = None
+    max_connect_attempts = 3  # initial + 2 retries
+    for attempt in range(1, max_connect_attempts + 1):
+        result["connect_attempts"] = attempt
+        clicked, source = _click_profile_connect_button(driver, timeout_s=timeout_s)
+        if not clicked:
+            diagnostics = _diagnose_connect_candidates(driver)
+            logger.info("connect diagnostics candidates=%s", len(diagnostics))
+            for idx, item in enumerate(diagnostics, start=1):
+                logger.info("connect diagnostics[%s]=%s", idx, item)
+            clicked, source = _click_ellipsis_then_connect(driver, timeout_s=timeout_s)
+
+        result["connect_clicked"] = clicked
+        result["connect_source"] = source
+        if not clicked:
+            logger.warning("connect button not clicked from profile or ellipsis menu (attempt %s/%s)", attempt, max_connect_attempts)
+            if attempt < max_connect_attempts:
+                _human_pause(1.8, 3.2, label="before_connect_retry_after_click_miss")
+            continue
+
+        _human_pause(3.5, 6.5, label="after_connect_click")
+        if _detect_pending_connection_request(driver):
+            logger.info("pending detected after connect click (attempt %s/%s)", attempt, max_connect_attempts)
+            result["pending_detected_after_connect"] = True
+            result["send_clicked"] = True
+            return result
+
+        logger.info("pending not detected after connect click (attempt %s/%s)", attempt, max_connect_attempts)
+        if attempt < max_connect_attempts:
+            _human_pause(1.8, 3.2, label="before_connect_retry_after_no_pending")
+            continue
+        break
+
     if not clicked:
-        diagnostics = _diagnose_connect_candidates(driver)
-        logger.info("connect diagnostics candidates=%s", len(diagnostics))
-        for idx, item in enumerate(diagnostics, start=1):
-            logger.info("connect diagnostics[%s]=%s", idx, item)
-        clicked, source = _click_ellipsis_then_connect(driver, timeout_s=timeout_s)
-    result["connect_clicked"] = clicked
-    result["connect_source"] = source
-    if not clicked:
-        logger.warning("connect button not clicked from profile or ellipsis menu")
         return result
 
-    _human_pause(3.5, 6.5, label="after_connect_click")
     post_click_dom = _capture_post_click_dom_diagnostics(driver)
     post_click_state = _classify_post_connect_state(driver)
     blockers_after_connect = _detect_interaction_blockers(driver)

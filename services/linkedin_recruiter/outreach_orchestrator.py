@@ -277,7 +277,11 @@ def _execute_profile_action(
             initial_wait_s=0,
             timeout_s=timeout_s,
         )
-        return "connection_request_sent", bool(details.get("send_clicked")), details
+        return (
+            "connection_request_sent",
+            bool(details.get("send_clicked")) or bool(details.get("pending_detected_after_connect")),
+            details,
+        )
 
     return "skipped", False, {}
 
