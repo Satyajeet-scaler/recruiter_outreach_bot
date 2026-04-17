@@ -120,6 +120,61 @@ python run_outreach.py items.json --debug
 
 ---
 
+## Generate outreach items from Google Sheets + Gemini
+
+Worksheets must follow your pipeline naming:
+
+- Recruiter rows: `role_recruiters_info_<role_slug>_<YYYY-MM-DD>`
+- Job descriptions: `role_relevant_<role_slug>_<YYYY-MM-DD>` with columns `job_url` and `description`
+
+For each row with a non-empty `recruiter_profile_url`, the tool matches `job_url` to the relevant sheet, pulls `description`, and asks Gemini for a short note (default max 300 characters).
+
+**Env (CLI and API):**
+
+- `GOOGLE_SHEET_ID` — ID from the Google Sheet URL (legacy: `SPREADSHEET_ID` also works)
+- `GOOGLE_SERVICE_ACCOUNT_JSON` — full service account JSON as a string (preferred on hosts without a file mount), **or** `GOOGLE_APPLICATION_CREDENTIALS` — path to the same JSON file
+- `GEMINI_API_KEY`
+- Optional: `GEMINI_MODEL` (default `gemini-2.5-flash`), `OUTREACH_MESSAGE_MAX_CHARS` (default `300` for CLI)
+
+Share the spreadsheet with the service account client email (Viewer is enough).
+
+**CLI** (default run date is **today**; override with `--date`):
+
+```bash
+export GOOGLE_SHEET_ID="..."
+export GOOGLE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
+# or: export GOOGLE_APPLICATION_CREDENTIALS="/path/to/sa.json"
+export GEMINI_API_KEY="..."
+
+python generate_outreach_items_from_sheet.py -o items.json
+python generate_outreach_items_from_sheet.py --date 2026-04-17 -o items.json
+python generate_outreach_items_from_sheet.py --dry-run
+python run_outreach.py items.json
+```
+
+**Test sheet + Gemini only** (outputs JSON with `profile_url` and `message_text` only; no LinkedIn):
+
+```bash
+python test_sheet_before_outreach.py -o items.json
+python test_sheet_before_outreach.py --format text
+python test_sheet_before_outreach.py --date 2026-04-17 --dry-run
+```
+
+**One-shot local pipeline** (same behavior as `POST /internal/run-sheet-pipeline`: sheet → Gemini → LinkedIn):
+
+```bash
+export GOOGLE_SHEET_ID="..."
+export GOOGLE_SERVICE_ACCOUNT_JSON='...'
+export GEMINI_API_KEY="..."
+
+python run_sheet_pipeline.py
+python run_sheet_pipeline.py --date 2026-04-17 --debug
+```
+
+**LinkedIn note length:** connection-request notes for 2nd/3rd-degree contacts are truncated to **200** characters inside the bot. If you need the full text delivered to everyone, set `--max-chars 200` (or lower).
+
+---
+
 ## Run API locally (FastAPI)
 
 ```bash
@@ -142,7 +197,23 @@ curl -X POST "http://localhost:8000/internal/linkedin-session" \
   --data-binary @"data/longin_storage.json"
 ```
 
-Trigger outreach:
+**Full pipeline** (Sheets → Gemini → LinkedIn outreach). Body is optional; field `date` as `YYYY-MM-DD` selects tab suffix; omit `date` for **today**:
+
+```bash
+curl -X POST "http://localhost:8000/internal/run-sheet-pipeline" \
+  -H "Content-Type: application/json" \
+  -H "X-Internal-Trigger-Token: your-token" \
+  -d '{}'
+```
+
+```bash
+curl -X POST "http://localhost:8000/internal/run-sheet-pipeline" \
+  -H "Content-Type: application/json" \
+  -H "X-Internal-Trigger-Token: your-token" \
+  -d '{"date": "2026-04-17"}'
+```
+
+Trigger outreach manually (pre-built items list):
 
 ```bash
 curl -X POST "http://localhost:8000/internal/run-outreach" \
@@ -170,6 +241,8 @@ This repo includes:
 ### Required Railway env vars
 
 - `INTERNAL_TRIGGER_TOKEN`
+
+For `/internal/run-sheet-pipeline` also set `GOOGLE_SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_APPLICATION_CREDENTIALS`), and `GEMINI_API_KEY`. LinkedIn session still uses `LINKEDIN_STORAGE_PATH` / volume as above.
 
 ### Recommended (Railway Volume) for session persistence
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, status
@@ -65,6 +66,15 @@ class OutreachRequest(BaseModel):
     storage_state_path: str | None = None
 
 
+class SheetPipelineRequest(BaseModel):
+    """Sheets → Gemini → LinkedIn outreach. Date defaults to today."""
+
+    date: date | None = Field(
+        default=None,
+        description="Pipeline run date (YYYY-MM-DD); tabs must match this date. Omit for today.",
+    )
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
     _configure_logging()
@@ -107,6 +117,68 @@ def upload_linkedin_session(
         "ok": True,
         "storage_path": str(path),
         "cookie_count": len(payload.get("cookies", [])),
+    }
+
+
+@app.post("/internal/run-sheet-pipeline")
+def run_sheet_pipeline(
+    payload: SheetPipelineRequest,
+    x_internal_trigger_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Read Google Sheet → generate Gemini messages → run LinkedIn outreach batch."""
+    _validate_internal_trigger_token(x_internal_trigger_token)
+
+    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SPREADSHEET_ID")
+    if not spreadsheet_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GOOGLE_SHEET_ID (or SPREADSHEET_ID) is not configured.",
+        )
+
+    from services.sheet_outreach.generate import generate_outreach_items, get_sheets_credentials
+
+    try:
+        creds = get_sheets_credentials()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    run_date = payload.date if payload.date is not None else date.today()
+
+    gen = generate_outreach_items(
+        spreadsheet_id=spreadsheet_id,
+        credentials=creds,
+        run_date=run_date,
+        dry_run=False,
+    )
+
+    if not gen.items:
+        return {
+            "ok": True,
+            "run_date": gen.run_date.isoformat(),
+            "generated_count": 0,
+            "warnings": gen.warnings,
+            "errors": gen.errors,
+            "outreach": None,
+            "message": "No outreach items produced; skipped LinkedIn run.",
+        }
+
+    results = run_outreach_batch_sync(gen.items)
+    success_count = sum(1 for row in results if row.get("success"))
+    return {
+        "ok": True,
+        "run_date": gen.run_date.isoformat(),
+        "generated_count": len(gen.items),
+        "warnings": gen.warnings,
+        "errors": gen.errors,
+        "outreach": {
+            "total": len(results),
+            "success_count": success_count,
+            "failure_count": len(results) - success_count,
+            "results": results,
+        },
     }
 
 
