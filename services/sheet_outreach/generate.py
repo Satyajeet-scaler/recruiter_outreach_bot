@@ -203,8 +203,8 @@ def generate_personalized_note(
             f"title={title_hint or 'n/a'}, company={company_hint or 'n/a'}."
         )
 
-    # Scaler LinkedIn outreach note template.
-    prompt = f"""You are writing a LinkedIn connection request note on behalf of someone at Scaler — an upskilling platform with a community of working professionals seeking career growth.
+    # Scaler LinkedIn outreach note template v2 (strict structure).
+    prompt = f"""You are writing a LinkedIn connection request note on behalf of someone at Scaler — an upskilling platform focused on career outcomes of its learners.
 
 Inputs:
 - Recipient name: {name_part}
@@ -214,17 +214,17 @@ Inputs:
 ---{optional_hints}
 
 Instructions:
-1. Extract the role, company name, and 1-2 key skills from the JD
-2. Write a LinkedIn connection note under {max_chars} characters (including spaces)
-3. Mention the recipient's name
-4. Reference the role and company
-5. Mention Scaler has professionals with the relevant skills
-6. Clarify Scaler is NOT a staffing or recruitment agency — it's a community of upskilling professionals
-7. No fees charged
-8. End with a soft CTA to review profiles
-9. Warm, concise, human tone
+1. Extract the exact role title and company name from the JD
+2. Strictly follow this template — do not deviate from the structure or tone:
 
-Return only the note. No explanation, no preamble."""
+"Hi {{name}}, I noticed that you are hiring for {{role}} at {{company}}. At Scaler we have working professionals who would be the right fit for the role, please revert back if you would be interested in reviewing our top 5 candidates. We are an upskilling platform focused on career outcomes of our learners and not a recruitment agency!"
+
+3. Only fill in {{name}}, {{role}}, and {{company}} — keep every other word exactly as written
+4. If company name is not found in the JD, omit "at {{company}}" cleanly
+5. The final note must be under {max_chars} characters including spaces
+6. If the template exceeds {max_chars} characters after filling in the values, shorten only the role title to its most common abbreviation — do not change anything else
+
+Return only the final note. No explanation, no preamble, no quotes."""
     last_error: Exception | None = None
     response = None
     for attempt in range(1, max(1, GEMINI_MAX_ATTEMPTS) + 1):

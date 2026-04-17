@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,74 @@ def _detect_chrome_major_version() -> int | None:
         except Exception:
             continue
     return None
+
+
+def _resolve_browser_driver_paths() -> tuple[str | None, str | None]:
+    """
+    Resolve browser + chromedriver paths across macOS/Linux with env overrides.
+
+    Env overrides (highest priority):
+    - CHROME_BINARY_PATH (or CHROMIUM_BINARY_PATH)
+    - CHROMEDRIVER_PATH
+    """
+    browser_env = (os.getenv("CHROME_BINARY_PATH") or os.getenv("CHROMIUM_BINARY_PATH") or "").strip()
+    driver_env = (os.getenv("CHROMEDRIVER_PATH") or "").strip()
+    browser_path = browser_env if browser_env and Path(browser_env).exists() else None
+    driver_path = driver_env if driver_env and Path(driver_env).exists() else None
+
+    if not browser_path:
+        browser_candidates: list[str] = []
+        if sys.platform == "darwin":
+            browser_candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "/opt/homebrew/bin/chromium",
+                "/opt/homebrew/bin/google-chrome",
+                "/usr/local/bin/chromium",
+                "/usr/local/bin/google-chrome",
+            ]
+        else:
+            browser_candidates = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+            ]
+        for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(cmd)
+            if found:
+                browser_candidates.append(found)
+        browser_path = next((p for p in browser_candidates if Path(p).exists()), None)
+
+    if not driver_path:
+        driver_candidates: list[str] = []
+        if sys.platform == "darwin":
+            driver_candidates = [
+                "/opt/homebrew/bin/chromedriver",
+                "/usr/local/bin/chromedriver",
+            ]
+        else:
+            driver_candidates = ["/usr/bin/chromedriver"]
+        found = shutil.which("chromedriver")
+        if found:
+            driver_candidates.append(found)
+        driver_path = next((p for p in driver_candidates if Path(p).exists()), None)
+
+    return browser_path, driver_path
+
+
+def _build_uc_chrome_kwargs(options: uc.ChromeOptions, *, version_main: int | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"options": options}
+    if version_main:
+        kwargs["version_main"] = version_main
+
+    browser_path, driver_path = _resolve_browser_driver_paths()
+    if browser_path:
+        kwargs["browser_executable_path"] = browser_path
+    if driver_path:
+        kwargs["driver_executable_path"] = driver_path
+    return kwargs
 
 
 def _to_selenium_cookie(cookie: dict[str, Any]) -> dict[str, Any]:
@@ -168,13 +238,8 @@ def click_profile_ellipsis_and_get_menu_options_sync(
     if headless:
         options.add_argument("--headless=new")
 
-    chrome_kwargs: dict[str, Any] = {"options": options}
     version_main = _detect_chrome_major_version()
-    if version_main:
-        chrome_kwargs["version_main"] = version_main
-    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT"):
-        chrome_kwargs["browser_executable_path"] = "/usr/bin/chromium"
-        chrome_kwargs["driver_executable_path"] = "/usr/bin/chromedriver"
+    chrome_kwargs = _build_uc_chrome_kwargs(options, version_main=version_main)
 
     logger.info("launching uc Chrome headless=%s version_main=%s", headless, version_main)
     driver = uc.Chrome(**chrome_kwargs)

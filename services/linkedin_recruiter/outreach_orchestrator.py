@@ -30,9 +30,11 @@ from services.linkedin_recruiter.connection_request_sender import (
 )
 from services.linkedin_recruiter.ellipsis_menu_service import (
     DEFAULT_STORAGE_PATH,
+    _build_uc_chrome_kwargs,
     _detect_chrome_major_version,
     _inject_linkedin_cookies,
     _load_storage,
+    _resolve_browser_driver_paths,
 )
 from services.linkedin_recruiter.message_sender import (
     _send_message_with_driver,
@@ -49,15 +51,15 @@ def _launch_uc_chrome() -> uc.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
-    chrome_kwargs: dict[str, Any] = {"options": options}
     version_main = _detect_chrome_major_version()
-    if version_main:
-        chrome_kwargs["version_main"] = version_main
-    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT"):
-        chrome_kwargs["browser_executable_path"] = "/usr/bin/chromium"
-        chrome_kwargs["driver_executable_path"] = "/usr/bin/chromedriver"
+    chrome_kwargs = _build_uc_chrome_kwargs(options, version_main=version_main)
 
-    logger.info("orchestrator launching uc.Chrome with virtual display version_main=%s", version_main)
+    logger.info(
+        "orchestrator launching uc.Chrome version_main=%s browser=%s driver=%s",
+        version_main,
+        chrome_kwargs.get("browser_executable_path"),
+        chrome_kwargs.get("driver_executable_path"),
+    )
     try:
         return uc.Chrome(**chrome_kwargs)
     except (URLError, socket.gaierror) as exc:
@@ -68,19 +70,19 @@ def _launch_uc_chrome() -> uc.Chrome:
             raise
         logger.warning("uc.Chrome launch failed with DNS resolution issue; falling back err=%s", exc)
 
-    chrome_binary = "/usr/bin/google-chrome"
-    if not os.path.exists(chrome_binary):
-        chrome_binary = "/usr/bin/chromium"
-    chromedriver_binary = "/usr/bin/chromedriver"
-    if not os.path.exists(chromedriver_binary):
-        raise RuntimeError("Could not launch browser: uc failed and /usr/bin/chromedriver not found.")
+    chrome_binary, chromedriver_binary = _resolve_browser_driver_paths()
+    if not chromedriver_binary:
+        raise RuntimeError(
+            "Could not launch browser: uc failed and chromedriver was not found. "
+            "Set CHROMEDRIVER_PATH for your system."
+        )
 
     selenium_options = webdriver.ChromeOptions()
     selenium_options.add_argument("--window-size=1440,2200")
     selenium_options.add_argument("--disable-dev-shm-usage")
     selenium_options.add_argument("--no-sandbox")
     selenium_options.add_argument("--disable-gpu")
-    if os.path.exists(chrome_binary):
+    if chrome_binary and os.path.exists(chrome_binary):
         selenium_options.binary_location = chrome_binary
 
     logger.info("orchestrator launching fallback selenium.Chrome binary=%s driver=%s", chrome_binary, chromedriver_binary)
