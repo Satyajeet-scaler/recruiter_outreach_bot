@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 
 RECRUITERS_TAB_RE = re.compile(r"^role_recruiters_info_(.+)_(\d{4}-\d{2}-\d{2})$")
 JD_MAX_CHARS = 8000
+OUTREACH_NOTES_HEADERS = [
+    "recruiter_name",
+    "recruiter_profile_url",
+    "job_description",
+    "personalized_note",
+]
 
 
 class OutreachItemDict(TypedDict):
@@ -107,13 +113,13 @@ def get_sheets_credentials(
     credentials_path: str | None = None,
     service_account_info: dict[str, Any] | None = None,
 ) -> Credentials:
-    """Resolve Google service account credentials for read-only Sheets access.
+    """Resolve Google service account credentials for read/write Sheets access.
 
     Precedence: explicit ``service_account_info`` → explicit ``credentials_path`` →
     env ``GOOGLE_SERVICE_ACCOUNT_JSON`` (raw JSON string) → env
     ``GOOGLE_APPLICATION_CREDENTIALS`` (file path).
     """
-    scopes = ("https://www.googleapis.com/auth/spreadsheets.readonly",)
+    scopes = ("https://www.googleapis.com/auth/spreadsheets",)
     if service_account_info is not None:
         return Credentials.from_service_account_info(service_account_info, scopes=scopes)
     if credentials_path:
@@ -136,6 +142,28 @@ def open_spreadsheet(credentials: Credentials, spreadsheet_id: str):
 
     gc = gspread.authorize(credentials)
     return gc.open_by_key(spreadsheet_id)
+
+
+def outreach_notes_tab_name(run_date: date) -> str:
+    return f"outreach_notes_{run_date.isoformat()}"
+
+
+def _get_or_create_worksheet(workbook: Any, title: str):
+    try:
+        return workbook.worksheet(title)
+    except Exception:
+        return workbook.add_worksheet(title=title, rows=1000, cols=16)
+
+
+def _ensure_header_row(worksheet: Any, headers: list[str]) -> None:
+    current_header = worksheet.row_values(1)
+    normalized_current = [str(x).strip() for x in current_header if str(x).strip()]
+    if normalized_current == headers:
+        return
+    if not normalized_current:
+        worksheet.update("A1:D1", [headers])
+        return
+    worksheet.insert_row(headers, 1)
 
 
 def _get_gemini_model(model_name: str):
@@ -238,6 +266,15 @@ def generate_outreach_items(
     items: list[OutreachItemDict] = []
 
     workbook = open_spreadsheet(credentials, spreadsheet_id)
+    notes_ws = None
+    notes_tab = outreach_notes_tab_name(run_date)
+    if not dry_run:
+        try:
+            notes_ws = _get_or_create_worksheet(workbook, notes_tab)
+            _ensure_header_row(notes_ws, OUTREACH_NOTES_HEADERS)
+        except Exception as exc:
+            errors.append(f"Could not initialize worksheet {notes_tab!r}: {exc}")
+            notes_ws = None
 
     matching_tabs: list[tuple[str, str]] = []
     for ws in workbook.worksheets():
@@ -325,6 +362,24 @@ def generate_outreach_items(
                 continue
 
             items.append({"profile_url": profile_url, "message_text": msg})
+            if notes_ws is not None:
+                try:
+                    notes_ws.append_row(
+                        [
+                            recruiter_name,
+                            profile_url,
+                            jd,
+                            msg,
+                        ],
+                        value_input_option="RAW",
+                    )
+                except Exception as exc:
+                    err = (
+                        f"Tab [{tab_title}] row {i}: failed to append to "
+                        f"{notes_tab!r}: {exc}"
+                    )
+                    logger.exception("%s", err)
+                    errors.append(err)
 
     return GenerateOutreachResult(
         run_date=run_date,
