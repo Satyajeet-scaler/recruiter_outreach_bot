@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, TypedDict
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 RECRUITERS_TAB_RE = re.compile(r"^role_recruiters_info_(.+)_(\d{4}-\d{2}-\d{2})$")
 JD_MAX_CHARS = 8000
+GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45"))
+GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "3"))
 OUTREACH_NOTES_HEADERS = [
     "recruiter_name",
     "recruiter_profile_url",
@@ -222,7 +225,36 @@ Instructions:
 9. Warm, concise, human tone
 
 Return only the note. No explanation, no preamble."""
-    response = model.generate_content(prompt)
+    last_error: Exception | None = None
+    response = None
+    for attempt in range(1, max(1, GEMINI_MAX_ATTEMPTS) + 1):
+        try:
+            response = model.generate_content(
+                prompt,
+                request_options={"timeout": GEMINI_TIMEOUT_SECONDS},
+            )
+            break
+        except Exception as exc:  # pragma: no cover - network/model failures are env-specific
+            last_error = exc
+            if attempt >= max(1, GEMINI_MAX_ATTEMPTS):
+                raise RuntimeError(
+                    "Gemini request failed after "
+                    f"{attempt} attempts (timeout={GEMINI_TIMEOUT_SECONDS}s): {exc}"
+                ) from exc
+            sleep_s = min(8.0, 1.5 * attempt)
+            logger.warning(
+                "Gemini request attempt %s/%s failed (timeout=%ss): %s; retrying in %.1fs",
+                attempt,
+                GEMINI_MAX_ATTEMPTS,
+                GEMINI_TIMEOUT_SECONDS,
+                exc,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+
+    if response is None:
+        # Defensive guard; should be unreachable because final attempt raises.
+        raise RuntimeError(f"Gemini request failed with no response: {last_error}")
     text = ""
     if response and getattr(response, "text", None):
         text = response.text.strip()
@@ -346,6 +378,12 @@ def generate_outreach_items(
                 )
                 continue
 
+            logger.info(
+                "Tab [%s] row %s: generating personalized note (profile=%s)",
+                tab_title,
+                i,
+                profile_url,
+            )
             try:
                 msg = generate_personalized_note(
                     recruiter_name=recruiter_name,
@@ -360,6 +398,7 @@ def generate_outreach_items(
                 logger.exception("%s", err)
                 errors.append(err)
                 continue
+            logger.info("Tab [%s] row %s: personalized note generated", tab_title, i)
 
             items.append({"profile_url": profile_url, "message_text": msg})
             if notes_ws is not None:
