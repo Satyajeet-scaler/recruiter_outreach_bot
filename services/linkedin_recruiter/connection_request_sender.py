@@ -71,7 +71,6 @@ def _capture_pre_send_click_debug_screenshot(driver: uc.Chrome) -> str | None:
             });
             if (!sendNode) return null;
 
-            sendNode.scrollIntoView({block: 'center'});
             const r = sendNode.getBoundingClientRect();
             const mark = document.createElement('div');
             const label = document.createElement('div');
@@ -242,7 +241,6 @@ def _click_send_shadow_aware(driver: uc.Chrome) -> bool:
                     return !b.disabled && (aria === 'send invitation' || txt === 'send');
                 });
                 if (!sendBtn) continue;
-                sendBtn.scrollIntoView({block:'center'});
                 sendBtn.focus();
                 const r = sendBtn.getBoundingClientRect();
                 const cx = Math.floor(r.left + (r.width / 2));
@@ -436,7 +434,6 @@ def _dispatch_mouse_sequence_js(driver: uc.Chrome, element: Any) -> bool:
                 """
                 const el = arguments[0];
                 if (!el) return false;
-                el.scrollIntoView({block:'center'});
                 const events = ['mouseover', 'mouseenter', 'mousemove', 'mousedown', 'mouseup', 'click'];
                 for (const ev of events) {
                     el.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -513,13 +510,7 @@ def _human_like_mouse_move_post_click(driver: uc.Chrome, element: Any, *, label:
 
 
 def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
-    """Human-like pre/post movement with stable click dispatch."""
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-        _human_pause(0.08, 0.24, label=f"{label}:after_scroll")
-    except Exception:
-        pass
-
+    """Human-like pre/post movement with stable click dispatch (no forced scrolling)."""
     _human_like_mouse_move(driver, element, label=f"{label}:pre_click_move")
     _human_pause(0.06, 0.2, label=f"{label}:after_mouse_move")
 
@@ -861,8 +852,6 @@ def _click_connect_near_ellipsis(driver: uc.Chrome, timeout_s: int) -> tuple[boo
             return True, "row_neighbor_to_ellipsis"
         return False, None
 
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", best)
-    time.sleep(0.25)
     try:
         best.click()
     except Exception:
@@ -916,8 +905,6 @@ def _click_profile_connect_button(driver: uc.Chrome, timeout_s: int) -> tuple[bo
                     continue
                 if rect.get("y", 9999) > 900:
                     continue
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                time.sleep(0.3)
                 try:
                     el.click()
                 except Exception:
@@ -1008,7 +995,6 @@ def _click_ellipsis_then_connect(driver: uc.Chrome, timeout_s: int) -> tuple[boo
             continue
         try:
             btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             _human_pause(0.6, 1.4, label="before_ellipsis_click")
             _human_like_mouse_move(driver, btn, label="ellipsis_button")
             if not _human_like_click(driver, btn, label=f"ellipsis:{selector}"):
@@ -1099,7 +1085,6 @@ def _click_add_note(driver: uc.Chrome, timeout_s: int) -> tuple[bool, str | None
             });
             if (match) {
                 const btn = match.closest('button, a, div[role=\"button\"]') || match;
-                btn.scrollIntoView({block:'center'});
                 const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
                 for (const ev of events) {
                     btn.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -1349,6 +1334,9 @@ def _detect_pending_connection_request(driver: uc.Chrome) -> bool:
                 const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
                 const title = norm(el.getAttribute && el.getAttribute('title'));
                 if (txt === 'pending' || aria.includes('pending') || title === 'pending') {
+                    const r = el.getBoundingClientRect();
+                    // Avoid right-rail and lower-page recommendation cards.
+                    if (r.x > 1000 || r.y > 900) continue;
                     if (el.closest('.pv-top-card-v2-ctas, .pv-top-card-v2-section__container, main')) return true;
                 }
             }
@@ -1483,7 +1471,6 @@ def _retry_connect_click_recorded_signature(driver: uc.Chrome) -> bool:
         window.__lastConnectClickRect = {
             x: Math.round(rr.x), y: Math.round(rr.y), w: Math.round(rr.width), h: Math.round(rr.height)
         };
-        clickNode.scrollIntoView({block:'center'});
         const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
         for (const ev of events) {
             clickNode.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -1592,7 +1579,6 @@ def _retry_send_click_recorded_signature(driver: uc.Chrome) -> bool:
             if (!target) continue;
             const btn = target.closest("button, a[role='button'], div[role='button']") || target;
             if (btn.disabled) continue;
-            btn.scrollIntoView({block:'center'});
             const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
             for (const ev of events) {
                 btn.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -1768,7 +1754,6 @@ def _fill_note_and_send(driver: uc.Chrome, timeout_s: int, note_text: str) -> tu
                     if (!sendNode) continue;
                     const btn = sendNode.closest('button, a, div[role=\"button\"]');
                     if (!btn || btn.disabled || !isVisible(btn)) continue;
-                    btn.scrollIntoView({block:'center'});
                     const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
                     for (const ev of events) {
                         btn.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -1827,7 +1812,6 @@ def _click_verify_now_if_present(driver: uc.Chrome) -> tuple[bool, str | None]:
                     });
                     if (!target) continue;
                     const btn = target.closest('button, a, div[role=\"button\"]') || target;
-                    btn.scrollIntoView({block:'center'});
                     const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
                     for (const ev of events) {
                         btn.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}));
@@ -1893,6 +1877,17 @@ def _send_connection_request_with_driver(
             continue
 
         _human_pause(3.5, 6.5, label="after_connect_click")
+
+        # Prefer invitation modal path first. If it is open, we should click
+        # Add a note and send, rather than short-circuiting as "pending".
+        if _has_invitation_dialog(driver):
+            logger.info(
+                "invitation dialog detected after connect click (attempt %s/%s); proceeding to add-note flow",
+                attempt,
+                max_connect_attempts,
+            )
+            break
+
         if _detect_pending_connection_request(driver):
             logger.info("pending detected after connect click (attempt %s/%s)", attempt, max_connect_attempts)
             result["pending_detected_after_connect"] = True
