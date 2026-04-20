@@ -1,0 +1,947 @@
+"""Basic LinkedIn inbox scraper bootstrap.
+
+Current scope:
+- Launch browser.
+- Login with LinkedIn credentials.
+- Detect the floating Messaging widget in the bottom area.
+
+This file is intentionally minimal so we can iteratively add:
+- inbox thread scraping
+- new message detection
+- context building
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import asdict, dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import undetected_chromedriver as uc
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from services.linkedin_recruiter.ellipsis_menu_service import (
+    _build_uc_chrome_kwargs,
+    _detect_chrome_major_version,
+    _inject_linkedin_cookies,
+    _load_storage,
+)
+from services.context_builder import ContextEvent
+from services.context_builder.sheet_store import (
+    DEFAULT_INTENT,
+    append_context_row_from_env,
+)
+
+logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_SESSION_PATH = _PROJECT_ROOT / "data" / "linkedin_storage.json"
+
+
+@dataclass(slots=True)
+class InboxScraperConfig:
+    """Runtime config for basic scraper bootstrap."""
+
+    headless: bool = False
+    storage_state_path: str = str(_DEFAULT_SESSION_PATH)
+    login_timeout_s: int = 45
+    post_login_wait_s: float = 4.0
+    wait_before_close_s: float = 2.0
+    linkedin_home_url: str = "https://www.linkedin.com/feed/"
+
+
+@dataclass(slots=True)
+class FloatingMessagingState:
+    """UI state for the floating messaging widget in LinkedIn."""
+
+    found: bool
+    visible: bool
+    widget_count: int
+    has_badge: bool
+    expanded_panel_visible: bool
+    selected_selector: str = ""
+    selected_rect: dict[str, int] | None = None
+    debug_reason: str = ""
+
+
+@dataclass(slots=True)
+class FloatingMessagingClickResult:
+    """Result of attempting to click/open the floating messaging widget."""
+
+    clicked: bool
+    click_strategy: str = ""
+    open_state_after_click: bool = False
+    debug_reason: str = ""
+
+
+@dataclass(slots=True)
+class MessagingConversationSnapshot:
+    """Single conversation row extracted from messaging overlay."""
+
+    profile_name: str
+    profile_url: str
+    snippet: str
+    timestamp_text: str
+    unread: bool
+    unread_reason: str = ""
+
+
+def _build_driver(*, headless: bool) -> uc.Chrome:
+    """Create a browser instance with stable defaults."""
+    options = uc.ChromeOptions()
+    options.add_argument("--window-size=1440,2200")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    if headless:
+        options.add_argument("--headless=new")
+
+    version_main = _detect_chrome_major_version()
+    chrome_kwargs = _build_uc_chrome_kwargs(options, version_main=version_main)
+    driver = uc.Chrome(**chrome_kwargs)
+    driver.set_page_load_timeout(60)
+    return driver
+
+
+def _wait_document_ready(driver: uc.Chrome, timeout_s: int = 30) -> None:
+    WebDriverWait(driver, timeout_s).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+
+def _inject_cookies_with_retry(
+    driver: uc.Chrome,
+    storage_data: dict[str, Any],
+    *,
+    attempts: int = 3,
+) -> int:
+    """Inject cookies with retries to handle transient renderer timeouts."""
+    last_exc: Exception | None = None
+    for idx in range(1, max(1, attempts) + 1):
+        try:
+            return _inject_linkedin_cookies(driver, storage_data)
+        except TimeoutException as exc:
+            last_exc = exc
+            logger.warning("cookie injection timeout attempt=%s/%s err=%s", idx, attempts, exc)
+            try:
+                # Stop pending load and retry from a clean navigation cycle.
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            time.sleep(min(2.5 * idx, 6.0))
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("cookie injection failed attempt=%s/%s err=%s", idx, attempts, exc)
+            time.sleep(min(1.5 * idx, 4.0))
+    raise RuntimeError("Failed to inject LinkedIn cookies after retries") from last_exc
+
+
+def _is_logged_in_shell_present(driver: uc.Chrome) -> bool:
+    """Best-effort check for logged-in LinkedIn shell across UI variants."""
+    js = """
+        const href = (window.location && window.location.href) ? window.location.href : '';
+        const title = (document.title || '').toLowerCase();
+        const lower = href.toLowerCase();
+        const blocked = (
+            lower.includes('/login') ||
+            lower.includes('/checkpoint') ||
+            lower.includes('/challenge') ||
+            lower.includes('/signup')
+        );
+        if (blocked) return false;
+
+        const titleLooksLoggedOut = (
+            title.includes('login') ||
+            title.includes('sign in') ||
+            title.includes('security verification')
+        );
+
+        const selectors = [
+            'header.global-nav',
+            '#global-nav',
+            '.global-nav',
+            "nav[aria-label*='Primary Navigation']",
+            "input[placeholder='Search']",
+            ".share-box-feed-entry__top-bar",
+            '#msg-overlay',
+            '.msg-overlay-container',
+            'aside.msg-overlay-list-bubble',
+            '.msg-overlay-bubble-header__badge-container',
+            '.feed-identity-module',
+            'main[role="main"]'
+        ];
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        let visibleSignals = 0;
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (isVisible(el)) visibleSignals += 1;
+        }
+        // Consider page logged-in when multiple surface signals are visible.
+        return !titleLooksLoggedOut && visibleSignals >= 2;
+    """
+    try:
+        return bool(driver.execute_script(js))
+    except Exception:
+        return False
+
+
+def _is_authwall_url(url: str) -> bool:
+    lower = (url or "").lower()
+    return any(
+        token in lower
+        for token in ("/login", "/checkpoint", "/challenge", "/signup", "/authwall")
+    )
+
+
+def _linkedin_credentials_from_env() -> tuple[str, str]:
+    """Read login credentials from env vars.
+
+    Required vars:
+    - LINKEDIN_EMAIL
+    - LINKEDIN_PASSWORD
+    """
+    email = os.environ.get("LINKEDIN_EMAIL", "").strip()
+    password = os.environ.get("LINKEDIN_PASSWORD", "").strip()
+    if not email or not password:
+        raise ValueError(
+            "LinkedIn credentials not found. Set LINKEDIN_EMAIL and LINKEDIN_PASSWORD."
+        )
+    return email, password
+
+
+def login_linkedin_with_credentials(
+    driver: uc.Chrome,
+    *,
+    email: str,
+    password: str,
+    timeout_s: int = 45,
+) -> None:
+    """Open login page and sign in with username/password."""
+    logger.info("opening linkedin login page")
+    driver.get("https://www.linkedin.com/login")
+    _wait_document_ready(driver)
+
+    logger.info("filling linkedin credentials")
+    email_input = WebDriverWait(driver, timeout_s).until(
+        EC.presence_of_element_located((By.ID, "username"))
+    )
+    password_input = WebDriverWait(driver, timeout_s).until(
+        EC.presence_of_element_located((By.ID, "password"))
+    )
+    email_input.clear()
+    email_input.send_keys(email)
+    password_input.clear()
+    password_input.send_keys(password)
+
+    sign_in_btn = WebDriverWait(driver, timeout_s).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
+    )
+    sign_in_btn.click()
+
+    WebDriverWait(driver, timeout_s).until(lambda d: _is_logged_in_shell_present(d))
+    logger.info("linkedin login success")
+
+
+def login_linkedin_with_storage_state(
+    driver: uc.Chrome,
+    *,
+    storage_state_path: str,
+    timeout_s: int = 45,
+) -> int:
+    """Restore login session by injecting cookies from storage-state JSON.
+
+    This intentionally mirrors existing working services:
+    - inject cookies
+    - navigate target page
+    - do lightweight authwall validation (not strict DOM gating)
+    """
+    path = Path(storage_state_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Storage JSON not found: {path}")
+
+    storage_data = _load_storage(path)
+    injected = _inject_cookies_with_retry(driver, storage_data, attempts=3)
+    if injected <= 0:
+        raise RuntimeError("No LinkedIn cookies were injected from storage state.")
+
+    driver.get("https://www.linkedin.com/feed/")
+    _wait_document_ready(driver)
+    # Give LinkedIn time to hydrate late widgets/top-nav before any checks.
+    time.sleep(2.5)
+
+    current_url = driver.current_url
+    if _is_authwall_url(current_url):
+        raise RuntimeError(
+            f"storage auth redirected to authwall url={current_url!r} title={driver.title!r}"
+        )
+
+    if not _is_logged_in_shell_present(driver):
+        # Keep this as warning-only to avoid false failures seen in this repo.
+        logger.warning(
+            "storage auth shell signals weak; continuing url=%s title=%s",
+            current_url,
+            driver.title,
+        )
+    logger.info("linkedin session restored via storage state cookies=%s", injected)
+    return injected
+
+
+def detect_floating_messaging_widget(driver: uc.Chrome) -> FloatingMessagingState:
+    """Inspect LinkedIn DOM and detect bottom floating messaging widget state."""
+    js = """
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const deepNodes = (root, selector) => {
+            const out = [];
+            const stack = [root];
+            while (stack.length) {
+                const node = stack.pop();
+                if (!node || !node.querySelectorAll) continue;
+                try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+            }
+            return out;
+        };
+        const roots = [document];
+        const interop = document.getElementById('interop-outlet');
+        if (interop) roots.push(interop);
+        if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+        const selectors = [
+            '#msg-overlay',
+            '.msg-overlay-container',
+            '.msg-overlay-list-bubble',
+            'aside.msg-overlay-list-bubble',
+            'aside[class*="msg-overlay"]'
+        ];
+
+        const nodes = [];
+        for (const sel of selectors) {
+            for (const root of roots) {
+                for (const n of deepNodes(root, sel)) nodes.push({selector: sel, node: n});
+            }
+        }
+        const seen = new WeakSet();
+        const uniq = [];
+        for (const item of nodes) {
+            if (!item || !item.node || seen.has(item.node)) continue;
+            seen.add(item.node);
+            uniq.push(item);
+        }
+        const visible = uniq.filter((item) => isVisible(item.node));
+
+        const score = (item) => {
+            const el = item.node;
+            const r = el.getBoundingClientRect();
+            let s = 0;
+            if (item.selector === '#msg-overlay') s += 300;
+            if (el.id === 'msg-overlay') s += 250;
+            if (el.classList && el.classList.contains('msg-overlay-container')) s += 120;
+            if (el.classList && el.classList.contains('msg-overlay-list-bubble--is-minimized')) s += 80;
+            if (el.querySelector && el.querySelector('#msg-overlay-list-bubble-header__button')) s += 100;
+            if (el.querySelector && el.querySelector('.msg-overlay-bubble-header__details')) s += 80;
+            if (r.y > (window.innerHeight * 0.55)) s += 60; // prefer bottom dock region
+            if (r.x > (window.innerWidth * 0.45)) s += 40;  // prefer right half
+            return s;
+        };
+        visible.sort((a, b) => score(b) - score(a));
+        const best = visible.length ? visible[0] : null;
+        const bestRect = best ? best.node.getBoundingClientRect() : null;
+
+        const hasBadge = visible.some((item) =>
+            !!item.node.querySelector('.notification-badge, .msg-badge, [class*="badge"], [aria-label*="unread"]')
+        );
+
+        const expandedPanelVisible = visible.some((item) =>
+            !!item.node.querySelector('.msg-conversations-container__convo-item, .msg-s-message-list-content, .msg-thread, .msg-form')
+        );
+
+        return {
+            found: uniq.length > 0,
+            visible: visible.length > 0,
+            widget_count: visible.length,
+            has_badge: hasBadge,
+            expanded_panel_visible: expandedPanelVisible,
+            selected_selector: best ? best.selector : '',
+            selected_rect: bestRect ? {
+                x: Math.round(bestRect.x),
+                y: Math.round(bestRect.y),
+                w: Math.round(bestRect.width),
+                h: Math.round(bestRect.height),
+            } : null,
+            debug_reason: visible.length > 0 ? "widget_visible" : (uniq.length > 0 ? "widget_hidden" : "widget_not_found"),
+        };
+    """
+    payload = driver.execute_script(js) or {}
+    return FloatingMessagingState(
+        found=bool(payload.get("found")),
+        visible=bool(payload.get("visible")),
+        widget_count=int(payload.get("widget_count", 0)),
+        has_badge=bool(payload.get("has_badge")),
+        expanded_panel_visible=bool(payload.get("expanded_panel_visible")),
+        debug_reason=str(payload.get("debug_reason", "")),
+        selected_selector=str(payload.get("selected_selector", "")),
+        selected_rect=payload.get("selected_rect"),
+    )
+
+
+def capture_messaging_widget_marked_screenshot(
+    driver: uc.Chrome,
+    *,
+    output_dir: Path | None = None,
+) -> str | None:
+    """Capture screenshot with highlight rectangle over detected messaging widget."""
+    out_dir = output_dir or (_PROJECT_ROOT / "debug_output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"floating_messaging_widget_{int(time.time() * 1000)}.png"
+
+    try:
+        driver.execute_script(
+            """
+            const isVisible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const deepNodes = (root, selector) => {
+                const out = [];
+                const stack = [root];
+                while (stack.length) {
+                    const node = stack.pop();
+                    if (!node || !node.querySelectorAll) continue;
+                    try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                    const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                    for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+                }
+                return out;
+            };
+            const roots = [document];
+            const interop = document.getElementById('interop-outlet');
+            if (interop) roots.push(interop);
+            if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+            const selectors = [
+                '#msg-overlay',
+                '.msg-overlay-container',
+                '.msg-overlay-list-bubble',
+                'aside.msg-overlay-list-bubble',
+                'aside[class*="msg-overlay"]',
+            ];
+            const raw = [];
+            for (const sel of selectors) {
+                for (const root of roots) raw.push(...deepNodes(root, sel));
+            }
+            const seen = new WeakSet();
+            const candidates = [];
+            for (const n of raw) {
+                if (!n || seen.has(n) || !isVisible(n)) continue;
+                seen.add(n);
+                candidates.push(n);
+            }
+
+            if (!candidates.length) return false;
+            const score = (el) => {
+                const r = el.getBoundingClientRect();
+                let s = 0;
+                if (el.id === 'msg-overlay') s += 300;
+                if (el.classList && el.classList.contains('msg-overlay-container')) s += 120;
+                if (el.classList && el.classList.contains('msg-overlay-list-bubble--is-minimized')) s += 80;
+                if (el.querySelector && el.querySelector('#msg-overlay-list-bubble-header__button')) s += 100;
+                if (el.querySelector && el.querySelector('.msg-overlay-bubble-header__details')) s += 80;
+                if (r.y > (window.innerHeight * 0.55)) s += 60;
+                if (r.x > (window.innerWidth * 0.45)) s += 40;
+                return s;
+            };
+            candidates.sort((a, b) => score(b) - score(a));
+            const target = candidates[0];
+            const r = target.getBoundingClientRect();
+            const stamp = Date.now();
+
+            const box = document.createElement('div');
+            box.id = `__msg_widget_marker_${stamp}`;
+            box.style.position = 'fixed';
+            box.style.left = `${Math.max(0, r.left - 2)}px`;
+            box.style.top = `${Math.max(0, r.top - 2)}px`;
+            box.style.width = `${Math.max(8, r.width + 4)}px`;
+            box.style.height = `${Math.max(8, r.height + 4)}px`;
+            box.style.border = '3px solid #00c853';
+            box.style.background = 'rgba(0, 200, 83, 0.10)';
+            box.style.zIndex = '2147483646';
+            box.style.pointerEvents = 'none';
+            box.style.boxSizing = 'border-box';
+
+            const label = document.createElement('div');
+            label.id = `__msg_widget_label_${stamp}`;
+            label.textContent = 'FloatingMessagingWidget detected';
+            label.style.position = 'fixed';
+            label.style.left = `${Math.max(0, r.left)}px`;
+            label.style.top = `${Math.max(0, r.top - 24)}px`;
+            label.style.padding = '3px 6px';
+            label.style.background = '#00c853';
+            label.style.color = '#fff';
+            label.style.font = '700 11px/1.2 Arial, sans-serif';
+            label.style.zIndex = '2147483647';
+            label.style.pointerEvents = 'none';
+
+            document.body.appendChild(box);
+            document.body.appendChild(label);
+            return true;
+            """
+        )
+        driver.save_screenshot(str(out_path))
+        return str(out_path)
+    except Exception as exc:
+        logger.warning("failed to capture marked messaging widget screenshot err=%s", exc)
+        return None
+    finally:
+        try:
+            driver.execute_script(
+                """
+                for (const n of Array.from(document.querySelectorAll("[id^='__msg_widget_marker_'], [id^='__msg_widget_label_']"))) {
+                    n.remove();
+                }
+                """
+            )
+        except Exception:
+            pass
+
+
+def click_floating_messaging_widget(driver: uc.Chrome) -> FloatingMessagingClickResult:
+    """Click the floating messaging widget using robust fallback strategies."""
+    js = """
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const deepNodes = (root, selector) => {
+            const out = [];
+            const stack = [root];
+            while (stack.length) {
+                const node = stack.pop();
+                if (!node || !node.querySelectorAll) continue;
+                try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+            }
+            return out;
+        };
+        const roots = [document];
+        const interop = document.getElementById('interop-outlet');
+        if (interop) roots.push(interop);
+        if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+        const selectors = [
+            '#msg-overlay',
+            '.msg-overlay-container',
+            '.msg-overlay-list-bubble',
+            'aside.msg-overlay-list-bubble',
+            'aside[class*="msg-overlay"]',
+        ];
+        const candidates = [];
+        const seen = new WeakSet();
+        for (const sel of selectors) {
+            for (const root of roots) {
+                for (const n of deepNodes(root, sel)) {
+                    if (!n || seen.has(n) || !isVisible(n)) continue;
+                    seen.add(n);
+                    candidates.push(n);
+                }
+            }
+        }
+        if (!candidates.length) {
+            return {clicked:false, click_strategy:'none', open_state_after_click:false, debug_reason:'widget_not_found'};
+        }
+
+        const score = (el) => {
+            const r = el.getBoundingClientRect();
+            let s = 0;
+            if (el.id === 'msg-overlay') s += 300;
+            if (el.classList && el.classList.contains('msg-overlay-container')) s += 120;
+            if (el.classList && el.classList.contains('msg-overlay-list-bubble--is-minimized')) s += 80;
+            if (el.querySelector && el.querySelector('#msg-overlay-list-bubble-header__button')) s += 120;
+            if (el.querySelector && el.querySelector('.msg-overlay-bubble-header__details')) s += 80;
+            if (r.y > (window.innerHeight * 0.55)) s += 60;
+            if (r.x > (window.innerWidth * 0.45)) s += 40;
+            return s;
+        };
+        candidates.sort((a, b) => score(b) - score(a));
+        const target = candidates[0];
+        const headerBtn = target.querySelector('#msg-overlay-list-bubble-header__button') ||
+                          target.querySelector('.msg-overlay-bubble-header__button') ||
+                          target.querySelector("button[aria-label*='messaging' i]") ||
+                          target.querySelector("button");
+
+        const openState = () => {
+            const roots2 = [document];
+            const interop2 = document.getElementById('interop-outlet');
+            if (interop2) roots2.push(interop2);
+            if (interop2 && interop2.shadowRoot) roots2.push(interop2.shadowRoot);
+            const selectors = [
+                '.msg-conversations-container__convo-item',
+                '.msg-conversation-listitem',
+                '.msg-thread',
+                '.msg-s-message-list-content',
+                '.msg-form'
+            ];
+            for (const root of roots2) {
+                for (const sel of selectors) {
+                    const nodes = deepNodes(root, sel).filter(isVisible);
+                    if (nodes.length) return true;
+                }
+            }
+            const bubble = target.querySelector('.msg-overlay-list-bubble') || target;
+            const cls = bubble.classList || target.classList;
+            if (cls && cls.contains('msg-overlay-list-bubble--is-minimized')) return false;
+            return false;
+        };
+
+        const clickElement = (el) => {
+            if (!el) return false;
+            try {
+                el.scrollIntoView({block:'end', inline:'nearest'});
+                el.focus();
+            } catch (_) {}
+            try {
+                el.click();
+                return true;
+            } catch (_) {}
+            try {
+                const r = el.getBoundingClientRect();
+                const cx = Math.floor(r.left + r.width / 2);
+                const cy = Math.floor(r.top + r.height / 2);
+                const events = ['pointerover','mouseover','pointerenter','mouseenter','pointermove','mousemove','pointerdown','mousedown','pointerup','mouseup','click'];
+                for (const ev of events) {
+                    const Evt = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    el.dispatchEvent(new Evt(ev, {bubbles:true, cancelable:true, composed:true, clientX:cx, clientY:cy, pointerType:'mouse'}));
+                }
+                return true;
+            } catch (_) {}
+            return false;
+        };
+
+        let strategy = 'none';
+        let clicked = false;
+        if (headerBtn && clickElement(headerBtn)) {
+            strategy = 'header_button_click';
+            clicked = true;
+        } else if (clickElement(target)) {
+            strategy = 'container_click';
+            clicked = true;
+        }
+
+        return {
+            clicked,
+            click_strategy: strategy,
+            open_state_after_click: clicked ? openState() : false,
+            debug_reason: clicked ? 'clicked' : 'click_failed',
+        };
+    """
+    payload = driver.execute_script(js) or {}
+    return FloatingMessagingClickResult(
+        clicked=bool(payload.get("clicked")),
+        click_strategy=str(payload.get("click_strategy", "")),
+        open_state_after_click=bool(payload.get("open_state_after_click")),
+        debug_reason=str(payload.get("debug_reason", "")),
+    )
+
+
+def extract_messaging_conversations(
+    driver: uc.Chrome,
+    *,
+    max_items: int = 25,
+) -> dict[str, Any]:
+    """Extract visible conversation rows and unread heuristics from messaging UI."""
+    js = """
+        const maxItems = Math.max(1, Math.min(100, Number(arguments[0] || 25)));
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const textOf = (el) => (el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+        const deepNodes = (root, selector) => {
+            const out = [];
+            const stack = [root];
+            while (stack.length) {
+                const node = stack.pop();
+                if (!node || !node.querySelectorAll) continue;
+                try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+            }
+            return out;
+        };
+        const roots = [document];
+        const interop = document.getElementById('interop-outlet');
+        if (interop) roots.push(interop);
+        if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+        const overlayCandidates = [];
+        const seenOverlay = new WeakSet();
+        for (const root of roots) {
+            for (const n of deepNodes(root, '#msg-overlay, .msg-overlay-container, aside[class*="msg-overlay"]')) {
+                if (!n || seenOverlay.has(n) || !isVisible(n)) continue;
+                seenOverlay.add(n);
+                overlayCandidates.push(n);
+            }
+        }
+
+        const rowSelectors = [
+            '.msg-conversations-container__convo-item',
+            'li.msg-conversations-container__convo-item',
+            '.msg-conversation-listitem',
+            '.msg-conversation-card',
+            '.msg-conversation-listitem--unread',
+            '[data-control-name*="conversation"]'
+        ];
+        const rows = [];
+        const seenRows = new WeakSet();
+        // Pass 1: rows under visible overlays.
+        for (const overlay of overlayCandidates) {
+            for (const sel of rowSelectors) {
+                for (const n of overlay.querySelectorAll(sel)) {
+                    if (!n || seenRows.has(n) || !isVisible(n)) continue;
+                    seenRows.add(n);
+                    rows.push(n);
+                }
+            }
+        }
+        // Pass 2 fallback: global deep search (some LinkedIn variants render list outside picked overlay node).
+        if (!rows.length) {
+            for (const root of roots) {
+                for (const sel of rowSelectors) {
+                    for (const n of deepNodes(root, sel)) {
+                        if (!n || seenRows.has(n) || !isVisible(n)) continue;
+                        seenRows.add(n);
+                        rows.push(n);
+                    }
+                }
+            }
+        }
+
+        const items = [];
+        for (const row of rows) {
+            const nameEl =
+                row.querySelector('.msg-conversation-listitem__participant-names') ||
+                row.querySelector('.msg-conversation-card__participant-names') ||
+                row.querySelector('.msg-conversation-listitem__name') ||
+                row.querySelector('h3') ||
+                row.querySelector('strong');
+            const snippetEl =
+                row.querySelector('.msg-conversation-listitem__summary') ||
+                row.querySelector('.msg-conversation-card__message-snippet') ||
+                row.querySelector('.msg-conversation-listitem__message-snippet') ||
+                row.querySelector('p');
+            const timeEl =
+                row.querySelector('time') ||
+                row.querySelector('.msg-conversation-listitem__time-stamp') ||
+                row.querySelector('.msg-conversation-card__time-stamp');
+            const linkEl = row.querySelector("a[href*='/messaging/thread/'], a[href*='/in/']");
+
+            const rowClass = (row.className || '').toLowerCase();
+            const badgeUnread = !!row.querySelector(
+                '.notification-badge, .msg-conversation-listitem__unread-count, [aria-label*="unread" i], [class*="unread"]'
+            );
+            const styleUnread = [nameEl, snippetEl].some((el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                const fw = parseInt(st.fontWeight || '400', 10);
+                return fw >= 600 || (el.className || '').toLowerCase().includes('t-bold');
+            });
+            const classUnread = rowClass.includes('unread') || rowClass.includes('new');
+            const unread = badgeUnread || classUnread || styleUnread;
+            const unreadReason =
+                badgeUnread ? 'badge' : (classUnread ? 'row_class' : (styleUnread ? 'bold_text' : ''));
+
+            const profileName = textOf(nameEl);
+            const snippet = textOf(snippetEl);
+            const timestampText = textOf(timeEl);
+            const profileUrl = linkEl ? (linkEl.getAttribute('href') || '') : '';
+            const normalizedProfileUrl =
+                profileUrl && profileUrl.startsWith('/') ? `https://www.linkedin.com${profileUrl}` : profileUrl;
+
+            if (!profileName && !snippet) continue;
+            items.push({
+                profile_name: profileName,
+                profile_url: normalizedProfileUrl,
+                snippet,
+                timestamp_text: timestampText,
+                unread,
+                unread_reason: unreadReason,
+            });
+            if (items.length >= maxItems) break;
+        }
+
+        const unreadCount = items.filter((x) => !!x.unread).length;
+        return {
+            found: overlayCandidates.length > 0 || items.length > 0,
+            count: items.length,
+            unread_count: unreadCount,
+            items,
+            debug_reason: items.length ? 'ok' : (overlayCandidates.length ? 'overlay_found_no_rows' : 'overlay_not_found'),
+        };
+    """
+    payload = driver.execute_script(js, max_items) or {}
+    raw_items = payload.get("items") or []
+    conversations: list[dict[str, Any]] = []
+    for item in raw_items:
+        snapshot = MessagingConversationSnapshot(
+            profile_name=str(item.get("profile_name", "")),
+            profile_url=str(item.get("profile_url", "")),
+            snippet=str(item.get("snippet", "")),
+            timestamp_text=str(item.get("timestamp_text", "")),
+            unread=bool(item.get("unread")),
+            unread_reason=str(item.get("unread_reason", "")),
+        )
+        conversations.append(asdict(snapshot))
+    return {
+        "found": bool(payload.get("found")),
+        "count": int(payload.get("count", 0)),
+        "unread_count": int(payload.get("unread_count", 0)),
+        "items": conversations,
+        "debug_reason": str(payload.get("debug_reason", "")),
+    }
+
+
+def extract_messaging_conversations_with_retry(
+    driver: uc.Chrome,
+    *,
+    max_items: int = 25,
+    attempts: int = 6,
+    interval_s: float = 1.0,
+) -> dict[str, Any]:
+    """Poll conversation extraction to handle delayed overlay hydration."""
+    last: dict[str, Any] = {}
+    total = max(1, attempts)
+    for idx in range(total):
+        snapshot = extract_messaging_conversations(driver, max_items=max_items)
+        last = snapshot
+        if int(snapshot.get("count", 0)) > 0:
+            snapshot["attempts_used"] = idx + 1
+            return snapshot
+        if idx < total - 1:
+            time.sleep(max(0.1, interval_s))
+    last["attempts_used"] = total
+    return last
+
+
+def run_inbox_scraper_bootstrap(config: InboxScraperConfig | None = None) -> dict[str, Any]:
+    """Run the minimal bootstrap flow and return a structured result."""
+    cfg = config or InboxScraperConfig()
+    driver = _build_driver(headless=cfg.headless)
+    try:
+        auth_mode = "storage_state"
+        cookie_count = 0
+        try:
+            cookie_count = login_linkedin_with_storage_state(
+                driver,
+                storage_state_path=cfg.storage_state_path,
+                timeout_s=cfg.login_timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("storage-state login failed; checking credentials fallback err=%s", exc)
+            email = os.environ.get("LINKEDIN_EMAIL", "").strip()
+            password = os.environ.get("LINKEDIN_PASSWORD", "").strip()
+            if email and password:
+                login_linkedin_with_credentials(
+                    driver,
+                    email=email,
+                    password=password,
+                    timeout_s=cfg.login_timeout_s,
+                )
+                auth_mode = "credentials_fallback"
+            else:
+                raise RuntimeError(
+                    "Storage-session login failed and credential fallback is not configured. "
+                    "Set LINKEDIN_EMAIL/LINKEDIN_PASSWORD only if you want fallback."
+                ) from exc
+
+        driver.get(cfg.linkedin_home_url)
+        _wait_document_ready(driver)
+        time.sleep(max(0.0, cfg.post_login_wait_s))
+
+        messaging_state = detect_floating_messaging_widget(driver)
+        click_result = click_floating_messaging_widget(driver) if messaging_state.visible else FloatingMessagingClickResult(
+            clicked=False,
+            click_strategy="skipped_widget_not_visible",
+            open_state_after_click=False,
+            debug_reason="widget_not_visible",
+        )
+        time.sleep(1.2)
+        conversation_snapshot = extract_messaging_conversations_with_retry(
+            driver,
+            max_items=25,
+            attempts=6,
+            interval_s=1.0,
+        )
+        for convo in conversation_snapshot.get("items", []):
+            unread = bool(convo.get("unread"))
+            event = ContextEvent(
+                event_type="inbound_unread_detected" if unread else "inbound_received",
+                intent=DEFAULT_INTENT,
+                summary="Observed recruiter conversation from messaging overlay.",
+                source="linkedin_inbox.inbox_scraper",
+                payload={
+                    "profile_name": str(convo.get("profile_name") or ""),
+                    "profile_url": str(convo.get("profile_url") or ""),
+                    "snippet": str(convo.get("snippet") or ""),
+                    "timestamp_text": str(convo.get("timestamp_text") or ""),
+                    "unread": unread,
+                    "unread_reason": str(convo.get("unread_reason") or ""),
+                },
+            )
+            append_context_row_from_env(
+                run_date=date.today(),
+                recruiter_name=str(convo.get("profile_name") or ""),
+                intent=DEFAULT_INTENT,
+                job_url="",
+                profile_url=str(convo.get("profile_url") or ""),
+                jd="",
+                personalized_note="",
+                action_taken="inbox_observed",
+                success=True,
+                skip_reason="",
+                source="linkedin_inbox.inbox_scraper",
+                current_event=event,
+                message_received="[]",
+                message_replied="[]",
+            )
+        screenshot_path = capture_messaging_widget_marked_screenshot(driver)
+        result = {
+            "ok": True,
+            "auth_mode": auth_mode,
+            "storage_state_path": str(Path(cfg.storage_state_path).expanduser().resolve()),
+            "cookie_count_injected": cookie_count,
+            "home_url": cfg.linkedin_home_url,
+            "floating_messaging_state": asdict(messaging_state),
+            "floating_messaging_click_result": asdict(click_result),
+            "messaging_conversations": conversation_snapshot,
+            "floating_messaging_marked_screenshot": screenshot_path,
+        }
+        logger.info("inbox scraper bootstrap result=%s", result)
+        return result
+    finally:
+        if cfg.wait_before_close_s > 0:
+            time.sleep(cfg.wait_before_close_s)
+        driver.quit()
+
