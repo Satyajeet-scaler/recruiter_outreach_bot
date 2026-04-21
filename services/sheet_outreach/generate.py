@@ -169,6 +169,31 @@ def _ensure_header_row(worksheet: Any, headers: list[str]) -> None:
     worksheet.insert_row(headers, 1)
 
 
+def _existing_outreach_profile_urls(worksheet: Any) -> set[str]:
+    """Read existing recruiter profile URLs from outreach_notes sheet."""
+    try:
+        rows = worksheet.get_all_values()
+    except Exception:
+        return set()
+    if not rows:
+        return set()
+
+    col_map = _header_index_map(rows[0])
+    idx = col_map.get("recruiter_profile_url")
+    if idx is None:
+        return set()
+
+    out: set[str] = set()
+    for row in rows[1:]:
+        if idx >= len(row):
+            continue
+        raw = str(row[idx]).strip()
+        if not raw:
+            continue
+        out.add(normalize_job_url(raw))
+    return out
+
+
 def _get_gemini_model(model_name: str):
     import google.generativeai as genai
 
@@ -304,9 +329,13 @@ def generate_outreach_items(
         try:
             notes_ws = _get_or_create_worksheet(workbook, notes_tab)
             _ensure_header_row(notes_ws, OUTREACH_NOTES_HEADERS)
+            existing_profile_urls = _existing_outreach_profile_urls(notes_ws)
         except Exception as exc:
             errors.append(f"Could not initialize worksheet {notes_tab!r}: {exc}")
             notes_ws = None
+            existing_profile_urls = set()
+    else:
+        existing_profile_urls = set()
 
     matching_tabs: list[tuple[str, str]] = []
     for ws in workbook.worksheets():
@@ -350,6 +379,12 @@ def generate_outreach_items(
             rd = _row_dict(r, col_map)
             profile_url = (rd.get("recruiter_profile_url") or "").strip()
             if not profile_url:
+                continue
+            normalized_profile_url = normalize_job_url(profile_url)
+            if not dry_run and normalized_profile_url in existing_profile_urls:
+                warnings.append(
+                    f"Tab [{tab_title}] row {i}: recruiter already present in {notes_tab}; skipped."
+                )
                 continue
             job_url = normalize_job_url(rd.get("job_url", ""))
             if not job_url:
@@ -412,6 +447,7 @@ def generate_outreach_items(
                         ],
                         value_input_option="RAW",
                     )
+                    existing_profile_urls.add(normalized_profile_url)
                 except Exception as exc:
                     err = (
                         f"Tab [{tab_title}] row {i}: failed to append to "
