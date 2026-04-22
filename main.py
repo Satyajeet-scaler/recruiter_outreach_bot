@@ -66,10 +66,12 @@ class OutreachRequest(BaseModel):
     storage_state_path: str | None = None
 
 
+import datetime
+
 class SheetPipelineRequest(BaseModel):
     """Sheets → Gemini → LinkedIn outreach. Date defaults to today."""
 
-    date: date | None = Field(
+    date: datetime.date | None = Field(
         default=None,
         description="Pipeline run date (YYYY-MM-DD); tabs must match this date. Omit for today.",
     )
