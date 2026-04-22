@@ -8,7 +8,7 @@ from .inbox_scraper import (
     click_floating_messaging_widget,
     extract_messaging_conversations,
     extract_messaging_conversations_with_retry,
-    run_inbox_scraper_bootstrap,
+    bootstrap_inbox_scraper,
 )
 
 __all__ = [
@@ -19,5 +19,5 @@ __all__ = [
     "click_floating_messaging_widget",
     "extract_messaging_conversations",
     "extract_messaging_conversations_with_retry",
-    "run_inbox_scraper_bootstrap",
+    "bootstrap_inbox_scraper",
 ]

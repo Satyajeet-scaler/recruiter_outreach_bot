@@ -22,7 +22,7 @@ def get_linkedin_storage_path() -> Path:
     raw = os.environ.get("LINKEDIN_STORAGE_PATH")
     if raw:
         return Path(raw).expanduser().resolve()
-    return _SERVICE_ROOT / "data" / "longin_storage.json"
+    return _SERVICE_ROOT / "data" / "linkedin_storage.json"
 
 
 def validate_playwright_storage_state(data: Any) -> dict[str, Any]:

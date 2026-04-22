@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,16 @@ from services.context_builder.sheet_store import (
     DEFAULT_INTENT,
     append_context_row_from_env,
 )
+from services.db.recruiter_store import get_recruiter_id_by_linkedin_url
+from services.db.conversation_store import (
+    get_conversation_by_recruiter_id, 
+    upsert_conversation, 
+)
+from services.db.linkedin_pm_sender_store import upsert_linkedin_pm_sender
+from services.db.message_store import save_message
+from services.db.models import RecruiterConversation, ConversationMessage, OwnerType
+from services.intent_engine.intent_service import process_latest_message_intent
+from services.linkedin_inbox.profile_resolver import resolve_recruiter_profile_url
 
 logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +64,8 @@ class InboxScraperConfig:
     post_login_wait_s: float = 4.0
     wait_before_close_s: float = 2.0
     linkedin_home_url: str = "https://www.linkedin.com/feed/"
+    watcher_mode: bool = False
+    watch_interval_s: int = 60
 
 
 @dataclass(slots=True)
@@ -845,7 +857,7 @@ def extract_messaging_conversations_with_retry(
     return last
 
 
-def run_inbox_scraper_bootstrap(config: InboxScraperConfig | None = None) -> dict[str, Any]:
+def bootstrap_inbox_scraper(config: InboxScraperConfig | None = None) -> dict[str, Any]:
     """Run the minimal bootstrap flow and return a structured result."""
     cfg = config or InboxScraperConfig()
     driver = _build_driver(headless=cfg.headless)
@@ -880,68 +892,346 @@ def run_inbox_scraper_bootstrap(config: InboxScraperConfig | None = None) -> dic
         _wait_document_ready(driver)
         time.sleep(max(0.0, cfg.post_login_wait_s))
 
-        messaging_state = detect_floating_messaging_widget(driver)
-        click_result = click_floating_messaging_widget(driver) if messaging_state.visible else FloatingMessagingClickResult(
-            clicked=False,
-            click_strategy="skipped_widget_not_visible",
-            open_state_after_click=False,
-            debug_reason="widget_not_visible",
-        )
-        time.sleep(1.2)
-        conversation_snapshot = extract_messaging_conversations_with_retry(
-            driver,
-            max_items=25,
-            attempts=6,
-            interval_s=1.0,
-        )
-        for convo in conversation_snapshot.get("items", []):
-            unread = bool(convo.get("unread"))
-            event = ContextEvent(
-                event_type="inbound_unread_detected" if unread else "inbound_received",
-                intent=DEFAULT_INTENT,
-                summary="Observed recruiter conversation from messaging overlay.",
-                source="linkedin_inbox.inbox_scraper",
-                payload={
-                    "profile_name": str(convo.get("profile_name") or ""),
-                    "profile_url": str(convo.get("profile_url") or ""),
-                    "snippet": str(convo.get("snippet") or ""),
-                    "timestamp_text": str(convo.get("timestamp_text") or ""),
-                    "unread": unread,
-                    "unread_reason": str(convo.get("unread_reason") or ""),
-                },
-            )
-            append_context_row_from_env(
-                run_date=date.today(),
-                recruiter_name=str(convo.get("profile_name") or ""),
-                intent=DEFAULT_INTENT,
-                job_url="",
-                profile_url=str(convo.get("profile_url") or ""),
-                jd="",
-                personalized_note="",
-                action_taken="inbox_observed",
-                success=True,
-                skip_reason="",
-                source="linkedin_inbox.inbox_scraper",
-                current_event=event,
-                message_received="[]",
-                message_replied="[]",
-            )
-        screenshot_path = capture_messaging_widget_marked_screenshot(driver)
-        result = {
-            "ok": True,
-            "auth_mode": auth_mode,
-            "storage_state_path": str(Path(cfg.storage_state_path).expanduser().resolve()),
-            "cookie_count_injected": cookie_count,
-            "home_url": cfg.linkedin_home_url,
-            "floating_messaging_state": asdict(messaging_state),
-            "floating_messaging_click_result": asdict(click_result),
-            "messaging_conversations": conversation_snapshot,
-            "floating_messaging_marked_screenshot": screenshot_path,
-        }
-        logger.info("inbox scraper bootstrap result=%s", result)
-        return result
+        # ... (previous code above)
+        
+        # We start the loop or return one-shot result
+        if getattr(cfg, "watcher_mode", False):
+            run_inbox_watcher(driver, cfg)
+            return {"ok": True, "mode": "watcher_completed"}
+        else:
+            return process_inbox_turn(driver, cfg, auth_mode, cookie_count)
+
     finally:
         if cfg.wait_before_close_s > 0:
             time.sleep(cfg.wait_before_close_s)
         driver.quit()
+
+def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: str, cookie_count: int) -> dict[str, Any]:
+    """
+    Perform a single scan of the inbox, resolve profiles, and update DB.
+    """
+    messaging_state = detect_floating_messaging_widget(driver)
+    click_result = click_floating_messaging_widget(driver) if messaging_state.visible else FloatingMessagingClickResult(
+        clicked=False,
+        click_strategy="skipped_widget_not_visible",
+        open_state_after_click=False,
+        debug_reason="widget_not_visible",
+    )
+    time.sleep(1.2)
+    conversation_snapshot = extract_messaging_conversations_with_retry(
+        driver,
+        max_items=25,
+        attempts=6,
+        interval_s=1.0,
+    )
+    
+    for convo in conversation_snapshot.get("items", []):
+        profile_name = str(convo.get("profile_name") or "")
+        profile_url = str(convo.get("profile_url") or "")
+        snippet = str(convo.get("snippet") or "")
+        unread = bool(convo.get("unread"))
+        
+        # Deep Resolve & DB Persistence
+        actual_profile_url = profile_url
+        if unread:
+            logger.info(f"Unread message from {profile_name}. Triggering Deep Resolve...")
+            def trigger_click():
+                js_click = """
+                const profileName = (arguments[0] || '').trim();
+                const normalize = (s) =>
+                    (s || '')
+                        .toLowerCase()
+                        .replace(/\\s+/g, ' ')
+                        .replace(/[^a-z0-9 ]/g, '')
+                        .trim();
+                const expectedFull = normalize(profileName);
+                const expectedFirst = normalize(profileName.split(' ')[0] || '');
+                if (!expectedFull && !expectedFirst) return false;
+
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const deepNodes = (root, selector) => {
+                    const out = [];
+                    const stack = [root];
+                    while (stack.length) {
+                        const node = stack.pop();
+                        if (!node || !node.querySelectorAll) continue;
+                        try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                        const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                        for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+                    }
+                    return out;
+                };
+                const roots = [document];
+                const interop = document.getElementById('interop-outlet');
+                if (interop) roots.push(interop);
+                if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+                const rowSelectors = [
+                    '.msg-conversations-container__convo-item',
+                    '.msg-conversation-listitem',
+                    '.msg-conversation-card',
+                    '[class*="convo-item"]',
+                    '[class*="convo-card"]',
+                    '[data-control-name*="conversation"]'
+                ];
+                const rows = [];
+                const seen = new WeakSet();
+                for (const root of roots) {
+                    for (const sel of rowSelectors) {
+                        for (const node of deepNodes(root, sel)) {
+                            if (!node || seen.has(node) || !isVisible(node)) continue;
+                            seen.add(node);
+                            rows.push(node);
+                        }
+                    }
+                }
+
+                const isDisallowedTarget = (el) => {
+                    if (!el) return false;
+                    return !!el.closest(
+                        [
+                            // "More" / ellipsis actions
+                            '[aria-label*="more" i]',
+                            '[aria-label*="ellipsis" i]',
+                            '[data-control-name*="more" i]',
+                            '[class*="ellipsis"]',
+                            // Profile/avatar/name links should not be clicked for thread-open action
+                            'a[href*="/in/"]',
+                            '[data-control-name*="view_profile" i]',
+                            '[class*="avatar"]',
+                            '.presence-entity',
+                        ].join(',')
+                    );
+                };
+
+                const clickableFor = (row) => {
+                    // Prefer explicit thread link if present, but never profile/ellipsis controls.
+                    const primary =
+                        row.querySelector('a[href*="/messaging/thread/"]') ||
+                        row.querySelector('[data-control-name*="open_conversation" i]') ||
+                        row.querySelector('[role="button"]');
+                    if (primary && !isDisallowedTarget(primary)) return primary;
+                    return row;
+                };
+
+                const clickElement = (el, row) => {
+                    if (!el) return false;
+                    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+                    try { el.focus(); } catch (_) {}
+                    if (!isDisallowedTarget(el)) {
+                        try { el.click(); return true; } catch (_) {}
+                    }
+                    try {
+                        // Click neutral zone on row body (avoids avatar/name on left and ellipsis on right).
+                        const base = row || el;
+                        const r = base.getBoundingClientRect();
+                        const cx = Math.floor(r.left + (r.width * 0.42));
+                        const cy = Math.floor(r.top + r.height / 2);
+                        let tgt = document.elementFromPoint(cx, cy) || base;
+                        if (isDisallowedTarget(tgt)) {
+                            const cx2 = Math.floor(r.left + (r.width * 0.58));
+                            tgt = document.elementFromPoint(cx2, cy) || base;
+                        }
+                        if (isDisallowedTarget(tgt)) tgt = base;
+                        const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                        for (const ev of events) {
+                            const Evt = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                            tgt.dispatchEvent(new Evt(ev, { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, pointerType: 'mouse' }));
+                        }
+                        return true;
+                    } catch (_) {}
+                    return false;
+                };
+
+                const scoreRow = (row) => {
+                    const text = normalize(row.innerText || '');
+                    if (!text) return -1;
+                    let score = 0;
+                    if (expectedFull && text.includes(expectedFull)) score += 100;
+                    if (expectedFirst && text.includes(expectedFirst)) score += 40;
+                    const rowClass = ((row.className || '') + ' ' + (row.getAttribute('aria-label') || '')).toLowerCase();
+                    if (rowClass.includes('unread') || rowClass.includes('new')) score += 15;
+                    if (row.querySelector('.notification-badge, [class*="unread"], [aria-label*="unread" i]')) score += 20;
+                    return score;
+                };
+
+                rows.sort((a, b) => scoreRow(b) - scoreRow(a));
+                const best = rows.find((r) => scoreRow(r) > 0);
+                if (!best) return false;
+                return clickElement(clickableFor(best), best);
+                """
+                return driver.execute_script(js_click, profile_name)
+            
+            deep_url = resolve_recruiter_profile_url(
+                driver,
+                trigger_click,
+                expected_profile_name=profile_name,
+            )
+            if deep_url:
+                actual_profile_url = deep_url
+                logger.info(
+                    "Deep Resolve success profile_name=%s resolved_profile_url=%s",
+                    profile_name,
+                    actual_profile_url,
+                )
+            else:
+                logger.info(
+                    "Deep Resolve no-url profile_name=%s fallback_profile_url=%s",
+                    profile_name,
+                    actual_profile_url,
+                )
+        
+        from services.linkedin_recruiter.message_sender import _find_message_composer_webelement, _close_message_modal_after_send, _fill_and_send_message
+        from services.linkedin_recruiter.connection_request_sender import _human_like_click
+
+        # 2. Click the composer to fully hydrate UI for reading/typing
+        composer = _find_message_composer_webelement(driver)
+        if composer:
+            logger.info("Focusing message composer native text area.")
+            _human_like_click(driver, composer, label="inbox_focus_composer")
+            time.sleep(1.2)
+
+        # --- Only process unread messages for DB storage & pipeline ---
+        if not unread:
+            logger.debug("Skipping read message from %s", profile_name)
+            continue
+
+        recruiter_id = get_recruiter_id_by_linkedin_url(actual_profile_url)
+        convo_id = None
+        msg_owner_type = OwnerType.RECRUITER_CONVERSATION
+        msg_owner_id = None
+
+        if recruiter_id:
+            logger.info(
+                "Recruiter match found profile_url=%s recruiter_id=%s",
+                actual_profile_url,
+                recruiter_id,
+            )
+            db_convo = get_conversation_by_recruiter_id(recruiter_id)
+            if not db_convo:
+                db_convo = RecruiterConversation(
+                    recruiter_id=recruiter_id,
+                    channel="linkedin",
+                    conversation_context_json={
+                        "profile_name": profile_name,
+                        "resolved_profile_url": actual_profile_url,
+                    },
+                )
+            db_convo.last_message_at = datetime.now()
+            convo_id = upsert_conversation(db_convo)
+            msg_owner_type = OwnerType.RECRUITER_CONVERSATION
+            msg_owner_id = convo_id
+            logger.info("Conversation upserted recruiter_id=%s conversation_id=%s", recruiter_id, convo_id)
+        else:
+            # Not in lusha_recruiters — store as a LinkedIn PM sender
+            logger.info("No recruiter match profile_url=%s — storing as linkedin_pm_sender", actual_profile_url)
+            sender_id = upsert_linkedin_pm_sender(
+                sender_name=profile_name,
+                linkedin_profile_url=actual_profile_url or None,
+            )
+            msg_owner_type = OwnerType.LINKEDIN_SENDER
+            msg_owner_id = sender_id
+            convo_id = None
+            logger.info("PM sender upserted sender_id=%s (no recruiter_conversation created)", sender_id)
+
+        msg = ConversationMessage(
+            conversation_id=convo_id,
+            owner_type=msg_owner_type,
+            owner_id=msg_owner_id,
+            sender_type="recruiter",
+            direction="inbound",
+            content_text=snippet,
+            context_source="linkedin_inbox.inbox_scraper",
+            message_context_json={
+                "unread": unread,
+                "owner_type": msg_owner_type.value,
+                "resolved_url": actual_profile_url,
+                "timestamp_text": str(convo.get("timestamp_text") or ""),
+            }
+        )
+        save_message(msg)
+        logger.info(
+            "Inbound message saved conversation_id=%s owner_type=%s owner_id=%s",
+            convo_id,
+            msg_owner_type.value,
+            msg_owner_id,
+        )
+        if msg_owner_type == OwnerType.RECRUITER_CONVERSATION:
+            intent_obj = process_latest_message_intent(convo_id, snippet)
+            logger.info("Intent processing completed conversation_id=%s intent=%s", convo_id, getattr(intent_obj, "value", intent_obj))
+            
+            if intent_obj and intent_obj.value in ("neutral", "positive_clarification"):
+                from services.response_generator.response_service import draft_response
+                logger.info("Conversation %s requires a drafted reply. Triggering response generator...", convo_id)
+                drafted_msg_id = draft_response(convo_id)
+                if drafted_msg_id:
+                    logger.info("Successfully drafted AI reply message_id=%s based on intent=%s", drafted_msg_id, intent_obj.value)
+                    
+                    from services.db.message_store import get_messages_by_conversation, update_message_delivery_status
+                    from services.db.models import DeliveryStatus
+                    
+                    # Fetch conversation messages to find the newly drafted one
+                    all_convo_msgs = get_messages_by_conversation(convo_id)
+                    drafted_msg = next((m for m in all_convo_msgs if m.id == drafted_msg_id), None)
+                    
+                    if drafted_msg and drafted_msg.content_text:
+                        logger.info("Auto-typing AI drafted reply natively into LinkedIn UI...")
+                        sent_ok, _ = _fill_and_send_message(driver, drafted_msg.content_text)
+                        if sent_ok:
+                            logger.info("Successfully transmitted mapped response for convo %s", convo_id)
+                            update_message_delivery_status(drafted_msg_id, DeliveryStatus.SENT)
+                        else:
+                            logger.error("Failed native message UI transmission for convo %s", convo_id)
+
+        # Always close the active message modal at the end of its turn to clean workspace state
+        logger.info("Tearing down message modal post-turn.")
+        _close_message_modal_after_send(driver)
+
+    screenshot_path = capture_messaging_widget_marked_screenshot(driver)
+    return {
+        "ok": True,
+        "auth_mode": auth_mode,
+        "cookie_count_injected": cookie_count,
+        "floating_messaging_state": asdict(messaging_state),
+        "messaging_conversations": conversation_snapshot,
+        "floating_messaging_marked_screenshot": screenshot_path,
+    }
+
+def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig):
+    """
+    Persistent loop to watch for unread messages.
+    """
+    interval = getattr(cfg, "watch_interval_s", 60)
+    duration_mins = int(os.environ.get("INBOX_WATCHER_DURATION_MINS", "20"))
+    end_time = time.time() + (duration_mins * 60)
+    logger.info(f"InboxWatcher: Starting persistent loop with {interval}s interval for {duration_mins} minutes.")
+    
+    while True:
+        if time.time() > end_time:
+            logger.info("InboxWatcher: Duration limit reached. Exiting.")
+            break
+            
+        try:
+            logger.info("InboxWatcher: Checking for updates...")
+            # Ensure we are on a page where the messaging widget is visible
+            if "linkedin.com" not in driver.current_url:
+                driver.get(cfg.linkedin_home_url)
+                time.sleep(4)
+            
+            process_inbox_turn(driver, cfg, "watcher", 0)
+            
+            logger.info(f"InboxWatcher: Turn complete. Sleeping for {interval}s.")
+            time.sleep(interval)
+            
+        except KeyboardInterrupt:
+            logger.info("InboxWatcher: Interrupted by user. Exiting.")
+            break
+        except Exception as exc:
+            logger.exception(f"InboxWatcher: Error in loop: {exc}")
+            time.sleep(interval)
 

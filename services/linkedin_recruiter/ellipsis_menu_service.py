@@ -86,18 +86,10 @@ def _resolve_browser_driver_paths() -> tuple[str | None, str | None]:
         browser_path = next((p for p in browser_candidates if Path(p).exists()), None)
 
     if not driver_path:
-        driver_candidates: list[str] = []
-        if sys.platform == "darwin":
-            driver_candidates = [
-                "/opt/homebrew/bin/chromedriver",
-                "/usr/local/bin/chromedriver",
-            ]
-        else:
-            driver_candidates = ["/usr/bin/chromedriver"]
-        found = shutil.which("chromedriver")
-        if found:
-            driver_candidates.append(found)
-        driver_path = next((p for p in driver_candidates if Path(p).exists()), None)
+        # We intentionally do not suggest system paths like /usr/bin/chromedriver here.
+        # If CHROMEDRIVER_PATH is not set, we return None so that undetected-chromedriver
+        # can download and manage its own writable version in the user's home directory.
+        pass
 
     return browser_path, driver_path
 
