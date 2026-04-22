@@ -13,20 +13,21 @@ from typing import Any, TypedDict
 
 from google.oauth2.service_account import Credentials
 
+from services.context_builder import ContextEvent
+from services.context_builder.sheet_store import (
+    DEFAULT_INTENT,
+    DEFAULT_MESSAGE_HISTORY,
+    append_context_row,
+    ensure_outreach_notes_headers,
+    get_or_create_outreach_notes_worksheet,
+)
+
 logger = logging.getLogger(__name__)
 
 RECRUITERS_TAB_RE = re.compile(r"^role_recruiters_info_(.+)_(\d{4}-\d{2}-\d{2})$")
 JD_MAX_CHARS = 8000
 GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45"))
 GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "3"))
-OUTREACH_NOTES_HEADERS = [
-    "recruiter_name",
-    "recruiter_profile_url",
-    "job_description",
-    "personalized_note",
-]
-
-
 class OutreachItemDict(TypedDict):
     profile_url: str
     message_text: str
@@ -147,8 +148,8 @@ def open_spreadsheet(credentials: Credentials, spreadsheet_id: str):
     return gc.open_by_key(spreadsheet_id)
 
 
-def outreach_notes_tab_name(run_date: date) -> str:
-    return f"outreach_notes_{run_date.isoformat()}"
+def outreach_notes_tab_name() -> str:
+    return "outreach_notes"
 
 
 def _get_or_create_worksheet(workbook: Any, title: str):
@@ -158,13 +159,25 @@ def _get_or_create_worksheet(workbook: Any, title: str):
         return workbook.add_worksheet(title=title, rows=1000, cols=16)
 
 
+def _a1_column_label(index_1_based: int) -> str:
+    if index_1_based < 1:
+        raise ValueError("A1 column index must be >= 1")
+    out: list[str] = []
+    current = index_1_based
+    while current > 0:
+        current, rem = divmod(current - 1, 26)
+        out.append(chr(ord("A") + rem))
+    return "".join(reversed(out))
+
+
 def _ensure_header_row(worksheet: Any, headers: list[str]) -> None:
     current_header = worksheet.row_values(1)
     normalized_current = [str(x).strip() for x in current_header if str(x).strip()]
     if normalized_current == headers:
         return
     if not normalized_current:
-        worksheet.update("A1:D1", [headers])
+        end_col = _a1_column_label(len(headers))
+        worksheet.update(f"A1:{end_col}1", [headers])
         return
     worksheet.insert_row(headers, 1)
 
@@ -324,11 +337,11 @@ def generate_outreach_items(
 
     workbook = open_spreadsheet(credentials, spreadsheet_id)
     notes_ws = None
-    notes_tab = outreach_notes_tab_name(run_date)
+    notes_tab = outreach_notes_tab_name()
     if not dry_run:
         try:
-            notes_ws = _get_or_create_worksheet(workbook, notes_tab)
-            _ensure_header_row(notes_ws, OUTREACH_NOTES_HEADERS)
+            notes_ws = get_or_create_outreach_notes_worksheet(workbook)
+            ensure_outreach_notes_headers(notes_ws)
             existing_profile_urls = _existing_outreach_profile_urls(notes_ws)
         except Exception as exc:
             errors.append(f"Could not initialize worksheet {notes_tab!r}: {exc}")
@@ -438,14 +451,36 @@ def generate_outreach_items(
             items.append({"profile_url": profile_url, "message_text": msg})
             if notes_ws is not None:
                 try:
-                    notes_ws.append_row(
-                        [
-                            recruiter_name,
-                            profile_url,
-                            jd,
-                            msg,
-                        ],
-                        value_input_option="RAW",
+                    event = ContextEvent(
+                        event_type="generated_message",
+                        intent=DEFAULT_INTENT,
+                        summary="Generated personalized outreach note from JD.",
+                        source="sheet_outreach.generate",
+                        payload={
+                            "tab_title": tab_title,
+                            "row_number": i,
+                            "job_url": job_url,
+                            "profile_url": profile_url,
+                            "message_text": msg,
+                            "no_previous_message_history": True,
+                        },
+                    )
+                    append_context_row(
+                        notes_ws,
+                        run_date=run_date,
+                        recruiter_name=recruiter_name,
+                        intent=DEFAULT_INTENT,
+                        job_url=job_url,
+                        profile_url=profile_url,
+                        jd=jd,
+                        personalized_note=msg,
+                        action_taken="generated_message",
+                        success=True,
+                        skip_reason="",
+                        source="sheet_outreach.generate",
+                        current_event=event,
+                        message_received=DEFAULT_MESSAGE_HISTORY,
+                        message_replied=DEFAULT_MESSAGE_HISTORY,
                     )
                     existing_profile_urls.add(normalized_profile_url)
                 except Exception as exc:

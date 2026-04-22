@@ -7,7 +7,7 @@ import os
 from datetime import date
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from services.linkedin_recruiter import run_outreach_batch_sync
@@ -211,3 +211,61 @@ def run_outreach(
         "failure_count": len(results) - success_count,
         "results": results,
     }
+
+
+class LushaOutreachRequest(BaseModel):
+    dry_run: bool = False
+    debug: bool = False
+    limit: int = Field(default=None, description="Max recruiters to process")
+    storage_state_path: str = None
+
+
+@app.post("/internal/run-lusha-outreach")
+def run_lusha_outreach_endpoint(
+    payload: LushaOutreachRequest,
+    x_internal_trigger_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Cron endpoint for processing lusha_recruiters with outreach_done=0."""
+    _validate_internal_trigger_token(x_internal_trigger_token)
+    
+    from run_lusha_outreach import run_lusha_outreach
+    
+    logger.info("Internal lusha outreach run requested")
+    
+    # We run the logic synchronously here
+    result = run_lusha_outreach(
+        dry_run=payload.dry_run,
+        debug=payload.debug,
+        limit=payload.limit,
+        storage_state_path=payload.storage_state_path,
+    )
+    
+    return result
+
+
+class InboxWatcherRequest(BaseModel):
+    headless: bool = False
+    watch_interval_s: int = 60
+
+
+@app.post("/internal/run-inbox-watcher")
+def run_inbox_watcher_endpoint(
+    background_tasks: BackgroundTasks,
+    payload: InboxWatcherRequest = InboxWatcherRequest(),
+    x_internal_trigger_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Start the persistent inbox watcher in the background."""
+    _validate_internal_trigger_token(x_internal_trigger_token)
+    
+    from services.linkedin_inbox.inbox_scraper import bootstrap_inbox_scraper, InboxScraperConfig
+    
+    cfg = InboxScraperConfig(
+        watcher_mode=True,
+        watch_interval_s=payload.watch_interval_s,
+        headless=payload.headless
+    )
+    
+    logger.info("Internal inbox watcher run requested in background")
+    background_tasks.add_task(bootstrap_inbox_scraper, cfg)
+    
+    return {"ok": True, "message": "Inbox watcher started in background"}

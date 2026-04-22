@@ -128,7 +128,7 @@ def main() -> None:
         nargs="?",
         type=Path,
         default=None,
-        help="Output JSON path (default: LINKEDIN_STORAGE_PATH or data/longin_storage.json)",
+        help="Output JSON path (default: LINKEDIN_STORAGE_PATH or data/linkedin_storage.json)",
     )
     parser.add_argument(
         "--no-upload",

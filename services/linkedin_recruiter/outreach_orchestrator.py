@@ -13,6 +13,7 @@ import logging
 import os
 import socket
 import time
+from datetime import date
 from urllib.error import URLError
 from pathlib import Path
 from typing import Any, Sequence
@@ -38,6 +39,11 @@ from services.linkedin_recruiter.ellipsis_menu_service import (
 )
 from services.linkedin_recruiter.message_sender import (
     _send_message_with_driver,
+)
+from services.context_builder import ContextEvent
+from services.context_builder.sheet_store import (
+    DEFAULT_INTENT,
+    append_context_row_from_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -409,6 +415,38 @@ def run_outreach_batch_sync(
                         compact = _compact_action_details(details, action)
                     if compact:
                         entry["details"] = compact
+
+                event_type = action
+                if action == "skipped" and entry.get("skip_reason") == "already_pending":
+                    event_type = "connection_request_already_pending"
+                context_event = ContextEvent(
+                    event_type=event_type,
+                    intent=DEFAULT_INTENT,
+                    summary=f"Outreach action resolved as {action}.",
+                    source="linkedin_recruiter.outreach_orchestrator",
+                    payload={
+                        "profile_url": profile_url,
+                        "connection_degree": entry.get("connection_degree"),
+                        "connection_bucket": entry.get("connection_bucket"),
+                        "action_taken": action,
+                        "success": success,
+                        "skip_reason": entry.get("skip_reason"),
+                    },
+                )
+                append_context_row_from_env(
+                    run_date=date.today(),
+                    recruiter_name="",
+                    intent=DEFAULT_INTENT,
+                    job_url="",
+                    profile_url=profile_url,
+                    jd="",
+                    personalized_note=message_text,
+                    action_taken=action,
+                    success=success,
+                    skip_reason=str(entry.get("skip_reason") or ""),
+                    source="linkedin_recruiter.outreach_orchestrator",
+                    current_event=context_event,
+                )
 
             except Exception as exc:
                 logger.exception("outreach profile failed url=%s step=exception", profile_url)
