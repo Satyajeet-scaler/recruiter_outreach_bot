@@ -260,11 +260,13 @@ def run_inbox_watcher_endpoint(
     _validate_internal_trigger_token(x_internal_trigger_token)
     
     from services.linkedin_inbox.inbox_scraper import bootstrap_inbox_scraper, InboxScraperConfig
+    from services.linkedin_session import get_linkedin_storage_path
     
     cfg = InboxScraperConfig(
         watcher_mode=True,
         watch_interval_s=payload.watch_interval_s,
-        headless=payload.headless
+        headless=payload.headless,
+        storage_state_path=str(get_linkedin_storage_path())
     )
     
     logger.info("Internal inbox watcher run requested in background")
