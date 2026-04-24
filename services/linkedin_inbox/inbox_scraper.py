@@ -44,8 +44,8 @@ from services.db.conversation_store import (
     upsert_conversation, 
 )
 from services.db.linkedin_pm_sender_store import upsert_linkedin_pm_sender
-from services.db.message_store import save_message
-from services.db.models import RecruiterConversation, ConversationMessage, OwnerType
+from services.db.message_store import save_message, get_messages_by_conversation, update_message_delivery_status
+from services.db.models import RecruiterConversation, ConversationMessage, OwnerType, DeliveryStatus
 from services.intent_engine.intent_service import process_latest_message_intent
 from services.linkedin_inbox.profile_resolver import resolve_recruiter_profile_url
 
@@ -287,8 +287,31 @@ def login_linkedin_with_storage_state(
     if injected <= 0:
         raise RuntimeError("No LinkedIn cookies were injected from storage state.")
 
-    driver.get("https://www.linkedin.com/feed/")
-    _wait_document_ready(driver)
+    # Set a custom page load timeout for resilience
+    driver.set_page_load_timeout(60)
+    
+    max_nav_attempts = 2
+    last_err = None
+    for attempt in range(1, max_nav_attempts + 1):
+        try:
+            logger.info("Navigating to LinkedIn feed (attempt %d/%d)...", attempt, max_nav_attempts)
+            driver.get("https://www.linkedin.com/feed/")
+            _wait_document_ready(driver)
+            break
+        except TimeoutException as te:
+            last_err = te
+            logger.warning("Timeout navigating to feed on attempt %d: %s", attempt, te)
+            if attempt < max_nav_attempts:
+                time.sleep(2)
+        except Exception as e:
+            last_err = e
+            logger.error("Unexpected error navigating to feed on attempt %d: %s", attempt, e)
+            if attempt < max_nav_attempts:
+                time.sleep(2)
+    else:
+        # If we exhausted attempts
+        raise RuntimeError(f"Failed to navigate to LinkedIn feed after {max_nav_attempts} attempts: {last_err}")
+
     # Give LinkedIn time to hydrate late widgets/top-nav before any checks.
     time.sleep(2.5)
 
@@ -380,9 +403,20 @@ def detect_floating_messaging_widget(driver: uc.Chrome) -> FloatingMessagingStat
             !!item.node.querySelector('.notification-badge, .msg-badge, [class*="badge"], [aria-label*="unread"]')
         );
 
-        const expandedPanelVisible = visible.some((item) =>
-            !!item.node.querySelector('.msg-conversations-container__convo-item, .msg-s-message-list-content, .msg-thread, .msg-form')
-        );
+        const expandedPanelVisible = visible.some((item) => {
+            const el = item.node;
+            // check for the conversations list container
+            const list = el.querySelector('.msg-overlay-list-bubble__conversations-list, .msg-conversations-container__convo-item, .msg-overlay-list-bubble__content');
+            if (list) {
+                const r = list.getBoundingClientRect();
+                if (r.height > 50) return true; 
+            }
+            // fallback: check the header button's aria state
+            const btn = el.querySelector('button[id*="header__button"], [class*="header__button"]');
+            if (btn && btn.getAttribute('aria-expanded') === 'true') return true;
+            
+            return false;
+        });
 
         return {
             found: uniq.length > 0,
@@ -676,6 +710,140 @@ def click_floating_messaging_widget(driver: uc.Chrome) -> FloatingMessagingClick
     )
 
 
+def click_conversation_by_name(driver: uc.Chrome, profile_name: str) -> bool:
+    """Find and click a specific conversation card in the messaging overlay by name."""
+    js_click = """
+    const profileName = (arguments[0] || '').trim();
+    const normalize = (s) =>
+        (s || '')
+            .toLowerCase()
+            .replace(/\\s+/g, ' ')
+            .replace(/[^a-z0-9 ]/g, '')
+            .trim();
+    const expectedFull = normalize(profileName);
+    const expectedFirst = normalize(profileName.split(' ')[0] || '');
+    if (!expectedFull && !expectedFirst) return false;
+
+    const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+    };
+    const deepNodes = (root, selector) => {
+        const out = [];
+        const stack = [root];
+        while (stack.length) {
+            const node = stack.pop();
+            if (!node || !node.querySelectorAll) continue;
+            try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+            const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+            for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+        }
+        return out;
+    };
+    const roots = [document];
+    const interop = document.getElementById('interop-outlet');
+    if (interop) roots.push(interop);
+    if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+    const rowSelectors = [
+        '.msg-conversations-container__convo-item',
+        '.msg-conversation-listitem',
+        '.msg-conversation-card',
+        '[class*="convo-item"]',
+        '[class*="convo-card"]',
+        '[data-control-name*="conversation"]'
+    ];
+    const rows = [];
+    const seen = new WeakSet();
+    for (const root of roots) {
+        for (const sel of rowSelectors) {
+            for (const node of deepNodes(root, sel)) {
+                if (!node || seen.has(node) || !isVisible(node)) continue;
+                seen.add(node);
+                rows.push(node);
+            }
+        }
+    }
+
+    const isDisallowedTarget = (el) => {
+        if (!el) return false;
+        return !!el.closest(
+            [
+                // "More" / ellipsis actions
+                '[aria-label*="more" i]',
+                '[aria-label*="ellipsis" i]',
+                '[data-control-name*="more" i]',
+                '[class*="ellipsis"]',
+                // Profile/avatar/name links should not be clicked for thread-open action
+                'a[href*="/in/"]',
+                '[data-control-name*="view_profile" i]',
+                '[class*="avatar"]',
+                '.presence-entity',
+            ].join(',')
+        );
+    };
+
+    const clickableFor = (row) => {
+        // Prefer explicit thread link if present, but never profile/ellipsis controls.
+        const primary =
+            row.querySelector('a[href*="/messaging/thread/"]') ||
+            row.querySelector('[data-control-name*="open_conversation" i]') ||
+            row.querySelector('[role="button"]');
+        if (primary && !isDisallowedTarget(primary)) return primary;
+        return row;
+    };
+
+    const clickElement = (el, row) => {
+        if (!el) return false;
+        try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        try { el.focus(); } catch (_) {}
+        if (!isDisallowedTarget(el)) {
+            try { el.click(); return true; } catch (_) {}
+        }
+        try {
+            // Click neutral zone on row body (avoids avatar/name on left and ellipsis on right).
+            const base = row || el;
+            const r = base.getBoundingClientRect();
+            const cx = Math.floor(r.left + (r.width * 0.42));
+            const cy = Math.floor(r.top + r.height / 2);
+            let tgt = document.elementFromPoint(cx, cy) || base;
+            if (isDisallowedTarget(tgt)) {
+                const cx2 = Math.floor(r.left + (r.width * 0.58));
+                tgt = document.elementFromPoint(cx2, cy) || base;
+            }
+            if (isDisallowedTarget(tgt)) tgt = base;
+            const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+            for (const ev of events) {
+                const Evt = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                tgt.dispatchEvent(new Evt(ev, { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, pointerType: 'mouse' }));
+            }
+            return true;
+        } catch (_) {}
+        return false;
+    };
+
+    const scoreRow = (row) => {
+        const text = normalize(row.innerText || '');
+        if (!text) return -1;
+        let score = 0;
+        if (expectedFull && text.includes(expectedFull)) score += 100;
+        if (expectedFirst && text.includes(expectedFirst)) score += 40;
+        const rowClass = ((row.className || '') + ' ' + (row.getAttribute('aria-label') || '')).toLowerCase();
+        if (rowClass.includes('unread') || rowClass.includes('new')) score += 15;
+        if (row.querySelector('.notification-badge, [class*="unread"], [aria-label*="unread" i]')) score += 20;
+        return score;
+    };
+
+    rows.sort((a, b) => scoreRow(b) - scoreRow(a));
+    const best = rows.find((r) => scoreRow(r) > 0);
+    if (!best) return false;
+    return clickElement(clickableFor(best), best);
+    """
+    return bool(driver.execute_script(js_click, profile_name))
+
+
 def extract_messaging_conversations(
     driver: uc.Chrome,
     *,
@@ -835,6 +1003,106 @@ def extract_messaging_conversations(
     }
 
 
+def extract_active_thread_messages(driver: uc.Chrome) -> list[dict[str, Any]]:
+    """Extract full message history from the currently open/active thread modal, including dates."""
+    js = """
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        const textOf = (el) => (el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+        const deepNodes = (root, selector) => {
+            const out = [];
+            const stack = [root];
+            while (stack.length) {
+                const node = stack.pop();
+                if (!node || !node.querySelectorAll) continue;
+                try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
+                const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
+            }
+            return out;
+        };
+        const roots = [document];
+        const interop = document.getElementById('interop-outlet');
+        if (interop) roots.push(interop);
+        if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+
+        // Find the expanded message thread container
+        const threadSelectors = [
+            '.msg-s-message-list-content',
+            '.msg-thread',
+            '.msg-s-message-list-container',
+            '[class*="message-list"]'
+        ];
+        let threadContainer = null;
+        for (const root of roots) {
+            for (const sel of threadSelectors) {
+                const found = deepNodes(root, sel).find(isVisible);
+                if (found) {
+                    threadContainer = found;
+                    break;
+                }
+            }
+            if (threadContainer) break;
+        }
+
+        if (!threadContainer) return [];
+
+        const history = [];
+        let currentDate = "Today"; 
+        
+        // Find all headings and message items in document order
+        const allItems = Array.from(threadContainer.querySelectorAll(
+            '.msg-s-message-list__time-heading, [class*="time-heading"], .msg-s-event-listitem, .msg-s-message-group, .msg-s-message-list__event'
+        ));
+        
+        for (const item of allItems) {
+            // Check if this item itself is a heading
+            if (item.classList.contains('msg-s-message-list__time-heading') || item.matches('[class*="time-heading"]')) {
+                currentDate = textOf(item);
+                continue;
+            }
+            
+            // Or if it contains a heading (sometimes the LI contains the heading)
+            const innerHeading = item.querySelector('.msg-s-message-list__time-heading, [class*="time-heading"]');
+            if (innerHeading && !item.querySelector('.msg-s-event-listitem__body, .msg-s-message-group__content')) {
+                currentDate = textOf(innerHeading);
+                continue;
+            }
+
+            // Extract message data if it's a message event
+            const nameEl = item.querySelector('.msg-s-message-group__name, .msg-s-event-listitem__name, h3, cite');
+            const timeEl = item.querySelector('time, .msg-s-event-listitem__time-stamp');
+            const bodyEl = item.querySelector('.msg-s-event-listitem__body, .msg-s-message-group__content, p, [class*="body"]');
+            
+            const sender = textOf(nameEl);
+            const msgTime = textOf(timeEl);
+            const content = textOf(bodyEl);
+            
+            if (!content && !sender) continue;
+
+            const isMe = item.classList.contains('msg-s-event-listitem--outbound') || 
+                         item.innerHTML.includes('msg-s-event-listitem--outbound') ||
+                         (item.closest && !!item.closest('.msg-s-event-listitem--outbound')) ||
+                         (sender.toLowerCase().includes('you'));
+
+            history.push({
+                sender: sender || (isMe ? 'Me' : 'Other'),
+                date_heading: currentDate,
+                time: msgTime,
+                full_timestamp: (currentDate + " " + msgTime).trim(),
+                content: content,
+                direction: isMe ? 'outbound' : 'inbound'
+            });
+        }
+        return history;
+    """
+    return driver.execute_script(js) or []
+
+
 def extract_messaging_conversations_with_retry(
     driver: uc.Chrome,
     *,
@@ -911,12 +1179,26 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
     Perform a single scan of the inbox, resolve profiles, and update DB.
     """
     messaging_state = detect_floating_messaging_widget(driver)
-    click_result = click_floating_messaging_widget(driver) if messaging_state.visible else FloatingMessagingClickResult(
-        clicked=False,
-        click_strategy="skipped_widget_not_visible",
-        open_state_after_click=False,
-        debug_reason="widget_not_visible",
-    )
+    
+    if messaging_state.visible and not messaging_state.expanded_panel_visible:
+        logger.info("Messaging widget visible but collapsed. Clicking to expand...")
+        click_result = click_floating_messaging_widget(driver)
+    elif messaging_state.visible and messaging_state.expanded_panel_visible:
+        logger.info("Messaging widget already expanded. Skipping click to maintain open state.")
+        click_result = FloatingMessagingClickResult(
+            clicked=False,
+            click_strategy="skipped_already_expanded",
+            open_state_after_click=True,
+            debug_reason="already_expanded",
+        )
+    else:
+        logger.warning("Messaging widget not visible or found.")
+        click_result = FloatingMessagingClickResult(
+            clicked=False,
+            click_strategy="skipped_widget_not_visible",
+            open_state_after_click=False,
+            debug_reason="widget_not_visible",
+        )
     time.sleep(1.2)
     conversation_snapshot = extract_messaging_conversations_with_retry(
         driver,
@@ -935,141 +1217,10 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
         actual_profile_url = profile_url
         if unread:
             logger.info(f"Unread message from {profile_name}. Triggering Deep Resolve...")
-            def trigger_click():
-                js_click = """
-                const profileName = (arguments[0] || '').trim();
-                const normalize = (s) =>
-                    (s || '')
-                        .toLowerCase()
-                        .replace(/\\s+/g, ' ')
-                        .replace(/[^a-z0-9 ]/g, '')
-                        .trim();
-                const expectedFull = normalize(profileName);
-                const expectedFirst = normalize(profileName.split(' ')[0] || '');
-                if (!expectedFull && !expectedFirst) return false;
-
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
-                };
-                const deepNodes = (root, selector) => {
-                    const out = [];
-                    const stack = [root];
-                    while (stack.length) {
-                        const node = stack.pop();
-                        if (!node || !node.querySelectorAll) continue;
-                        try { out.push(...Array.from(node.querySelectorAll(selector))); } catch (_) {}
-                        const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
-                        for (const el of all) if (el && el.shadowRoot) stack.push(el.shadowRoot);
-                    }
-                    return out;
-                };
-                const roots = [document];
-                const interop = document.getElementById('interop-outlet');
-                if (interop) roots.push(interop);
-                if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
-
-                const rowSelectors = [
-                    '.msg-conversations-container__convo-item',
-                    '.msg-conversation-listitem',
-                    '.msg-conversation-card',
-                    '[class*="convo-item"]',
-                    '[class*="convo-card"]',
-                    '[data-control-name*="conversation"]'
-                ];
-                const rows = [];
-                const seen = new WeakSet();
-                for (const root of roots) {
-                    for (const sel of rowSelectors) {
-                        for (const node of deepNodes(root, sel)) {
-                            if (!node || seen.has(node) || !isVisible(node)) continue;
-                            seen.add(node);
-                            rows.push(node);
-                        }
-                    }
-                }
-
-                const isDisallowedTarget = (el) => {
-                    if (!el) return false;
-                    return !!el.closest(
-                        [
-                            // "More" / ellipsis actions
-                            '[aria-label*="more" i]',
-                            '[aria-label*="ellipsis" i]',
-                            '[data-control-name*="more" i]',
-                            '[class*="ellipsis"]',
-                            // Profile/avatar/name links should not be clicked for thread-open action
-                            'a[href*="/in/"]',
-                            '[data-control-name*="view_profile" i]',
-                            '[class*="avatar"]',
-                            '.presence-entity',
-                        ].join(',')
-                    );
-                };
-
-                const clickableFor = (row) => {
-                    // Prefer explicit thread link if present, but never profile/ellipsis controls.
-                    const primary =
-                        row.querySelector('a[href*="/messaging/thread/"]') ||
-                        row.querySelector('[data-control-name*="open_conversation" i]') ||
-                        row.querySelector('[role="button"]');
-                    if (primary && !isDisallowedTarget(primary)) return primary;
-                    return row;
-                };
-
-                const clickElement = (el, row) => {
-                    if (!el) return false;
-                    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
-                    try { el.focus(); } catch (_) {}
-                    if (!isDisallowedTarget(el)) {
-                        try { el.click(); return true; } catch (_) {}
-                    }
-                    try {
-                        // Click neutral zone on row body (avoids avatar/name on left and ellipsis on right).
-                        const base = row || el;
-                        const r = base.getBoundingClientRect();
-                        const cx = Math.floor(r.left + (r.width * 0.42));
-                        const cy = Math.floor(r.top + r.height / 2);
-                        let tgt = document.elementFromPoint(cx, cy) || base;
-                        if (isDisallowedTarget(tgt)) {
-                            const cx2 = Math.floor(r.left + (r.width * 0.58));
-                            tgt = document.elementFromPoint(cx2, cy) || base;
-                        }
-                        if (isDisallowedTarget(tgt)) tgt = base;
-                        const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
-                        for (const ev of events) {
-                            const Evt = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
-                            tgt.dispatchEvent(new Evt(ev, { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, pointerType: 'mouse' }));
-                        }
-                        return true;
-                    } catch (_) {}
-                    return false;
-                };
-
-                const scoreRow = (row) => {
-                    const text = normalize(row.innerText || '');
-                    if (!text) return -1;
-                    let score = 0;
-                    if (expectedFull && text.includes(expectedFull)) score += 100;
-                    if (expectedFirst && text.includes(expectedFirst)) score += 40;
-                    const rowClass = ((row.className || '') + ' ' + (row.getAttribute('aria-label') || '')).toLowerCase();
-                    if (rowClass.includes('unread') || rowClass.includes('new')) score += 15;
-                    if (row.querySelector('.notification-badge, [class*="unread"], [aria-label*="unread" i]')) score += 20;
-                    return score;
-                };
-
-                rows.sort((a, b) => scoreRow(b) - scoreRow(a));
-                const best = rows.find((r) => scoreRow(r) > 0);
-                if (!best) return false;
-                return clickElement(clickableFor(best), best);
-                """
-                return driver.execute_script(js_click, profile_name)
             
             deep_url = resolve_recruiter_profile_url(
                 driver,
-                trigger_click,
+                lambda: click_conversation_by_name(driver, profile_name),
                 expected_profile_name=profile_name,
             )
             if deep_url:
@@ -1139,27 +1290,65 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
             convo_id = None
             logger.info("PM sender upserted sender_id=%s (no recruiter_conversation created)", sender_id)
 
-        msg = ConversationMessage(
-            conversation_id=convo_id,
-            owner_type=msg_owner_type,
-            owner_id=msg_owner_id,
-            sender_type="recruiter",
-            direction="inbound",
-            content_text=snippet,
-            context_source="linkedin_inbox.inbox_scraper",
-            message_context_json={
-                "unread": unread,
-                "owner_type": msg_owner_type.value,
-                "resolved_url": actual_profile_url,
-                "timestamp_text": str(convo.get("timestamp_text") or ""),
-            }
-        )
-        save_message(msg)
+        # --- Full History Synchronization ---
+        history = extract_active_thread_messages(driver)
+        logger.info("Thread history extracted for %s: %d items", profile_name, len(history))
+
+        # Fetch existing messages to avoid duplicates
+        existing_msgs: list[ConversationMessage] = []
+        if convo_id:
+            existing_msgs = get_messages_by_conversation(convo_id)
+        
+        new_messages_count = 0
+        for h_msg in history:
+            def timestamps_match(db_ts, fresh_ts):
+                if not db_ts or not fresh_ts: return False
+                if db_ts == fresh_ts: return True
+                # Normalize "NEW" markers (e.g. "TODAY NEW" vs "TODAY 5:28 PM")
+                db_norm = db_ts.replace("NEW", "").strip()
+                fresh_norm = fresh_ts.replace("NEW", "").strip()
+                # If they share the same date prefix and content/direction match, it's a match
+                return db_norm == fresh_norm or db_norm in fresh_norm or fresh_norm in db_norm
+
+            # Duplicate detection: match on content, direction and normalized full_timestamp
+            is_dup = any(
+                m.content_text == h_msg["content"] and 
+                m.direction == h_msg["direction"] and
+                timestamps_match((m.message_context_json or {}).get("full_timestamp"), h_msg["full_timestamp"])
+                for m in existing_msgs
+            )
+            
+            if not is_dup:
+                # Map direction to sender_type
+                # Inbound -> recruiter, Outbound -> bot (default for bot-managed flow)
+                s_type = "recruiter" if h_msg["direction"] == "inbound" else "bot"
+                
+                new_msg = ConversationMessage(
+                    conversation_id=convo_id,
+                    owner_type=msg_owner_type,
+                    owner_id=msg_owner_id,
+                    sender_type=s_type,
+                    direction=h_msg["direction"],
+                    content_text=h_msg["content"],
+                    context_source="linkedin_inbox.inbox_scraper.sync",
+                    message_context_json={
+                        "unread": unread,
+                        "owner_type": msg_owner_type.value,
+                        "resolved_url": actual_profile_url,
+                        "full_timestamp": h_msg["full_timestamp"],
+                        "date_heading": h_msg["date_heading"],
+                        "time": h_msg["time"],
+                    }
+                )
+                save_message(new_msg)
+                new_messages_count += 1
+                # Update existing_msgs so we don't save the same history item twice if it repeats in the same list
+                existing_msgs.append(new_msg)
+
         logger.info(
-            "Inbound message saved conversation_id=%s owner_type=%s owner_id=%s",
-            convo_id,
-            msg_owner_type.value,
-            msg_owner_id,
+            "Sync complete for %s. New messages saved: %d",
+            profile_name,
+            new_messages_count
         )
         if msg_owner_type == OwnerType.RECRUITER_CONVERSATION:
             intent_obj = process_latest_message_intent(convo_id, snippet)
@@ -1171,9 +1360,6 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
                 drafted_msg_id = draft_response(convo_id)
                 if drafted_msg_id:
                     logger.info("Successfully drafted AI reply message_id=%s based on intent=%s", drafted_msg_id, intent_obj.value)
-                    
-                    from services.db.message_store import get_messages_by_conversation, update_message_delivery_status
-                    from services.db.models import DeliveryStatus
                     
                     # Fetch conversation messages to find the newly drafted one
                     all_convo_msgs = get_messages_by_conversation(convo_id)

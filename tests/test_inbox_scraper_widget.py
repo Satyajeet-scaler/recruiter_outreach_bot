@@ -134,6 +134,30 @@ def main() -> None:
             attempts=6,
             interval_s=1.0,
         )
+
+        # New: Detect and click on an unread message card if exists
+        unread_items = [c for c in conversations.get("items", []) if c.get("unread")]
+        unread_click_result = None
+        if unread_items:
+            target = unread_items[0]
+            target_name = target.get("profile_name", "Unknown")
+            logging.info("Found %d unread messages. Attempting to click on: %s", len(unread_items), target_name)
+            clicked = inbox_scraper.click_conversation_by_name(driver, target_name)
+            unread_click_result = {
+                "profile_name": target_name,
+                "clicked": clicked
+            }
+            if clicked:
+                logging.info("Successfully clicked on unread message card for %s", target_name)
+                time.sleep(2.5) # Wait for thread to open and hydrate
+                history = inbox_scraper.extract_active_thread_messages(driver)
+                unread_click_result["thread_history"] = history
+                logging.info("Extracted %d messages from active thread.", len(history))
+            else:
+                logging.warning("Failed to click on unread message card for %s", target_name)
+        else:
+            logging.info("No unread messages found to click.")
+
         screenshot_path = inbox_scraper.capture_messaging_widget_marked_screenshot(driver)
 
         result = {
@@ -147,6 +171,7 @@ def main() -> None:
             "dom_marker_counts": marker_counts,
             "floating_messaging_state": asdict(state),
             "floating_messaging_click_result": asdict(click_result),
+            "unread_message_click_test": unread_click_result,
             "messaging_conversations": conversations,
             "floating_messaging_marked_screenshot": screenshot_path,
         }
