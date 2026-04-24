@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any
 
 import undetected_chromedriver as uc
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from urllib3.exceptions import ReadTimeoutError
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -1165,7 +1166,36 @@ def bootstrap_inbox_scraper(config: InboxScraperConfig | None = None) -> dict[st
         
         # We start the loop or return one-shot result
         if getattr(cfg, "watcher_mode", False):
-            run_inbox_watcher(driver, cfg)
+            max_restarts = 5
+            for restart_count in range(max_restarts):
+                try:
+                    if restart_count > 0:
+                        logger.info(f"Self-Healing: Restarting watcher (attempt {restart_count}/{max_restarts})...")
+                    run_inbox_watcher(driver, cfg)
+                    logger.info("InboxWatcher: Completed naturally.")
+                    break
+                except (WebDriverException, ReadTimeoutError) as de:
+                    logger.warning(f"Self-Healing: Driver failure detected: {de}. Recycling driver...")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    
+                    # Refresh driver and re-login
+                    driver = _build_driver(headless=cfg.headless)
+                    # Note: We reuse the same logic for re-login
+                    try:
+                        login_linkedin_with_storage_state(
+                            driver,
+                            storage_state_path=cfg.storage_state_path,
+                            timeout_s=cfg.login_timeout_s,
+                        )
+                    except Exception as le:
+                        logger.error(f"Self-Healing: Re-login failed: {le}. Aborting restart loop.")
+                        raise
+                except Exception as e:
+                    logger.error(f"Self-Healing: Unexpected non-driver error: {e}. Exiting.")
+                    raise
             return {"ok": True, "mode": "watcher_completed"}
         else:
             return process_inbox_turn(driver, cfg, auth_mode, cookie_count)
@@ -1408,6 +1438,7 @@ def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig):
             # Ensure we are on a page where the messaging widget is visible
             if "linkedin.com" not in driver.current_url:
                 driver.get(cfg.linkedin_home_url)
+                _wait_document_ready(driver)
                 time.sleep(4)
             
             process_inbox_turn(driver, cfg, "watcher", 0)
@@ -1418,7 +1449,11 @@ def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig):
         except KeyboardInterrupt:
             logger.info("InboxWatcher: Interrupted by user. Exiting.")
             break
+        except (WebDriverException, ReadTimeoutError) as de:
+            # Critical driver failure — raise it to the high-level bootstrap for recycling
+            logger.error(f"InboxWatcher: Critical driver failure detected: {de}")
+            raise 
         except Exception as exc:
-            logger.exception(f"InboxWatcher: Error in loop: {exc}")
+            logger.exception(f"InboxWatcher: recovered from unexpected error in loop: {exc}")
             time.sleep(interval)
 
