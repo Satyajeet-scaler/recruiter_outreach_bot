@@ -248,6 +248,7 @@ def run_lusha_outreach_endpoint(
 class InboxWatcherRequest(BaseModel):
     headless: bool = False
     watch_interval_s: int = 60
+    duration_mins: int = 20
 
 
 @app.post("/internal/run-inbox-watcher")
@@ -265,6 +266,7 @@ def run_inbox_watcher_endpoint(
     cfg = InboxScraperConfig(
         watcher_mode=True,
         watch_interval_s=payload.watch_interval_s,
+        duration_mins=payload.duration_mins,
         headless=payload.headless,
         storage_state_path=str(get_linkedin_storage_path())
     )

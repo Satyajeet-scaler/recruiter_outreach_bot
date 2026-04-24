@@ -66,6 +66,7 @@ class InboxScraperConfig:
     linkedin_home_url: str = "https://www.linkedin.com/feed/"
     watcher_mode: bool = False
     watch_interval_s: int = 60
+    duration_mins: int = 20
 
 
 @dataclass(slots=True)
@@ -1393,7 +1394,7 @@ def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig):
     Persistent loop to watch for unread messages.
     """
     interval = getattr(cfg, "watch_interval_s", 60)
-    duration_mins = int(os.environ.get("INBOX_WATCHER_DURATION_MINS", "20"))
+    duration_mins = getattr(cfg, "duration_mins", 20)
     end_time = time.time() + (duration_mins * 60)
     logger.info(f"InboxWatcher: Starting persistent loop with {interval}s interval for {duration_mins} minutes.")
     
