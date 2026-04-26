@@ -1167,11 +1167,13 @@ def bootstrap_inbox_scraper(config: InboxScraperConfig | None = None) -> dict[st
         # We start the loop or return one-shot result
         if getattr(cfg, "watcher_mode", False):
             max_restarts = 5
+            duration_mins = getattr(cfg, "duration_mins", 20)
+            end_time = time.time() + (duration_mins * 60)
             for restart_count in range(max_restarts):
                 try:
                     if restart_count > 0:
                         logger.info(f"Self-Healing: Restarting watcher (attempt {restart_count}/{max_restarts})...")
-                    run_inbox_watcher(driver, cfg)
+                    run_inbox_watcher(driver, cfg, override_end_time=end_time)
                     logger.info("InboxWatcher: Completed naturally.")
                     break
                 except (WebDriverException, ReadTimeoutError) as de:
@@ -1431,14 +1433,19 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
         "floating_messaging_marked_screenshot": screenshot_path,
     }
 
-def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig):
+def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig, override_end_time: float | None = None):
     """
     Persistent loop to watch for unread messages.
     """
     interval = getattr(cfg, "watch_interval_s", 60)
     duration_mins = getattr(cfg, "duration_mins", 20)
-    end_time = time.time() + (duration_mins * 60)
-    logger.info(f"InboxWatcher: Starting persistent loop with {interval}s interval for {duration_mins} minutes.")
+    end_time = override_end_time or (time.time() + (duration_mins * 60))
+    
+    if not override_end_time:
+        logger.info(f"InboxWatcher: Starting persistent loop with {interval}s interval for {duration_mins} minutes.")
+    else:
+        remaining = max(0, int((end_time - time.time()) / 60))
+        logger.info(f"InboxWatcher: Resuming loop. {remaining} minutes remaining.")
     
     while True:
         if time.time() > end_time:
