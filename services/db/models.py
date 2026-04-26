@@ -9,6 +9,8 @@ class IntentLabel(str, Enum):
     POSITIVE_CLARIFICATION = "positive_clarification"
     NEUTRAL = "neutral"
     NON_RELEVANT = "non_relevant"
+    CLARIFYING_DOUBTS = "clarifying_doubts"
+    WANT_TOP_CANDIDATES = "want_top_candidates"
 
 class DeliveryStatus(str, Enum):
     PENDING = "pending"

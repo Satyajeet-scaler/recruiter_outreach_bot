@@ -1383,14 +1383,26 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
         )
         if msg_owner_type == OwnerType.RECRUITER_CONVERSATION:
             intent_obj = process_latest_message_intent(convo_id, snippet)
-            logger.info("Intent processing completed conversation_id=%s intent=%s", convo_id, getattr(intent_obj, "value", intent_obj))
+            intent_val = getattr(intent_obj, "value", str(intent_obj))
+            logger.info("Intent processing completed conversation_id=%s intent=%s", convo_id, intent_val)
             
-            if intent_obj and intent_obj.value in ("neutral", "positive_clarification"):
+            # Send Slack notification for high-value conversation intents
+            SLACK_INTENTS = ("positive", "positive_clarification", "clarifying_doubts", "want_top_candidates")
+            if intent_obj and intent_val in SLACK_INTENTS:
+                try:
+                    from services.slack_notify_service import notify_intent_event
+                    notify_intent_event(convo_id, intent_val, profile_name, actual_profile_url)
+                except Exception as slack_err:
+                    logger.error(f"Failed to trigger Slack notification for convo {convo_id}: {slack_err}")
+
+            # Trigger auto-reply for specific intents (note: 'want_top_candidates' is Slack-only now)
+            REPLY_INTENTS = ("neutral", "positive_clarification", "clarifying_doubts")
+            if intent_obj and intent_val in REPLY_INTENTS:
                 from services.response_generator.response_service import draft_response
                 logger.info("Conversation %s requires a drafted reply. Triggering response generator...", convo_id)
                 drafted_msg_id = draft_response(convo_id)
                 if drafted_msg_id:
-                    logger.info("Successfully drafted AI reply message_id=%s based on intent=%s", drafted_msg_id, intent_obj.value)
+                    logger.info("Successfully drafted AI reply message_id=%s based on intent=%s", drafted_msg_id, intent_val)
                     
                     # Fetch conversation messages to find the newly drafted one
                     all_convo_msgs = get_messages_by_conversation(convo_id)
