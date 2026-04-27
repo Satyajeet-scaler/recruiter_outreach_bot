@@ -510,26 +510,6 @@ def _human_like_mouse_move(driver: uc.Chrome, element: Any, *, label: str) -> No
             ) from exc
 
 
-def _human_like_mouse_move_post_click(driver: uc.Chrome, element: Any, *, label: str) -> None:
-    """Small post-click movement to avoid static cursor pattern."""
-    try:
-        rect = driver.execute_script(
-            "const r=arguments[0].getBoundingClientRect(); return {w:Math.max(1,Math.round(r.width)),h:Math.max(1,Math.round(r.height))};",
-            element,
-        ) or {"w": 1, "h": 1}
-        width = max(1, int(rect.get("w", 1)))
-        height = max(1, int(rect.get("h", 1)))
-        half_w = max(0, width // 2)
-        half_h = max(0, height // 2)
-        # Move near outer edge after click (still near element, not modal backdrop).
-        x = random.choice([-1, 1]) * max(1, min(half_w - 1, 8))
-        y = random.choice([-1, 1]) * max(1, min(half_h - 1, 6))
-        ActionChains(driver).move_to_element_with_offset(element, x, y).pause(random.uniform(0.05, 0.12)).perform()
-        logger.info("mouse post-click movement completed label=%s offset=(%s,%s)", label, x, y)
-    except Exception as exc:
-        logger.info("mouse post-click movement failed label=%s err=%s", label, exc)
-
-
 def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
     """Human-like pre/post movement with stable click dispatch (no forced scrolling)."""
     _human_like_mouse_move(driver, element, label=f"{label}:pre_click_move")
@@ -538,7 +518,6 @@ def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
     try:
         element.click()
         logger.info("click success via WebElement.click label=%s", label)
-        _human_like_mouse_move_post_click(driver, element, label=f"{label}:post_click_move")
         _human_pause(0.14, 0.42, label=f"{label}:after_click")
         return True
     except Exception as exc:
@@ -551,7 +530,6 @@ def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
     try:
         driver.execute_script("arguments[0].click();", element)
         logger.info("click success via JS element.click label=%s", label)
-        _human_like_mouse_move_post_click(driver, element, label=f"{label}:post_click_move")
         _human_pause(0.14, 0.42, label=f"{label}:after_click")
         return True
     except Exception as exc:
@@ -563,7 +541,6 @@ def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
 
     if _dispatch_mouse_sequence_js(driver, element):
         logger.info("click success via JS mouse sequence label=%s", label)
-        _human_like_mouse_move_post_click(driver, element, label=f"{label}:post_click_move")
         _human_pause(0.14, 0.42, label=f"{label}:after_click")
         return True
     return False
