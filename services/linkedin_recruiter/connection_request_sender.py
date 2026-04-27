@@ -15,6 +15,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import WebDriverException
 import undetected_chromedriver as uc
 
 from services.linkedin_recruiter.ellipsis_menu_service import (
@@ -24,6 +25,22 @@ from services.linkedin_recruiter.ellipsis_menu_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_local_webdriver_timeout_error(exc: Exception) -> bool:
+    """True when exception chain indicates WebDriver localhost read timeout."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        msg = str(current)
+        if (
+            "HTTPConnectionPool(host='localhost'" in msg
+            and "Read timed out" in msg
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _project_root_dir() -> Path:
@@ -487,6 +504,10 @@ def _human_like_mouse_move(driver: uc.Chrome, element: Any, *, label: str) -> No
         )
     except Exception as exc:
         logger.info("mouse movement failed label=%s err=%s", label, exc)
+        if _is_local_webdriver_timeout_error(exc):
+            raise WebDriverException(
+                f"Critical WebDriver timeout during mouse move: {label}"
+            ) from exc
 
 
 def _human_like_mouse_move_post_click(driver: uc.Chrome, element: Any, *, label: str) -> None:
@@ -522,6 +543,10 @@ def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
         return True
     except Exception as exc:
         logger.info("click WebElement.click failed label=%s err=%s", label, exc)
+        if _is_local_webdriver_timeout_error(exc):
+            raise WebDriverException(
+                f"Critical WebDriver timeout during WebElement.click: {label}"
+            ) from exc
 
     try:
         driver.execute_script("arguments[0].click();", element)
@@ -531,6 +556,10 @@ def _human_like_click(driver: uc.Chrome, element: Any, *, label: str) -> bool:
         return True
     except Exception as exc:
         logger.info("click JS element.click failed label=%s err=%s", label, exc)
+        if _is_local_webdriver_timeout_error(exc):
+            raise WebDriverException(
+                f"Critical WebDriver timeout during JS click: {label}"
+            ) from exc
 
     if _dispatch_mouse_sequence_js(driver, element):
         logger.info("click success via JS mouse sequence label=%s", label)

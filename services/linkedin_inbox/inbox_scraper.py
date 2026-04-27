@@ -55,6 +55,22 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SESSION_PATH = _PROJECT_ROOT / "data" / "linkedin_storage.json"
 
 
+def _is_local_webdriver_timeout_error(exc: Exception) -> bool:
+    """Detect localhost WebDriver read timeouts across wrapped exception chains."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        msg = str(current)
+        if (
+            "HTTPConnectionPool(host='localhost'" in msg
+            and "Read timed out" in msg
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass(slots=True)
 class InboxScraperConfig:
     """Runtime config for basic scraper bootstrap."""
@@ -1196,6 +1212,26 @@ def bootstrap_inbox_scraper(config: InboxScraperConfig | None = None) -> dict[st
                         logger.error(f"Self-Healing: Re-login failed: {le}. Aborting restart loop.")
                         raise
                 except Exception as e:
+                    if _is_local_webdriver_timeout_error(e):
+                        logger.warning(
+                            "Self-Healing: Timeout signature detected in generic exception; recycling driver. err=%s",
+                            e,
+                        )
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = _build_driver(headless=cfg.headless)
+                        try:
+                            login_linkedin_with_storage_state(
+                                driver,
+                                storage_state_path=cfg.storage_state_path,
+                                timeout_s=cfg.login_timeout_s,
+                            )
+                        except Exception as le:
+                            logger.error(f"Self-Healing: Re-login failed: {le}. Aborting restart loop.")
+                            raise
+                        continue
                     logger.error(f"Self-Healing: Unexpected non-driver error: {e}. Exiting.")
                     raise
             return {"ok": True, "mode": "watcher_completed"}
@@ -1473,6 +1509,12 @@ def run_inbox_watcher(driver: uc.Chrome, cfg: InboxScraperConfig, override_end_t
             logger.error(f"InboxWatcher: Critical driver failure detected: {de}")
             raise 
         except Exception as exc:
+            if _is_local_webdriver_timeout_error(exc):
+                logger.error(
+                    "InboxWatcher: Timeout signature detected; escalating for driver recycle. err=%s",
+                    exc,
+                )
+                raise WebDriverException("Critical WebDriver localhost read timeout") from exc
             logger.exception(f"InboxWatcher: recovered from unexpected error in loop: {exc}")
             time.sleep(interval)
 
