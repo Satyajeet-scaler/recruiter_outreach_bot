@@ -1424,14 +1424,51 @@ def process_inbox_turn(driver: uc.Chrome, cfg: InboxScraperConfig, auth_mode: st
             intent_val = getattr(intent_obj, "value", str(intent_obj))
             logger.info("Intent processing completed conversation_id=%s intent=%s", convo_id, intent_val)
             
-            # Send Slack notification for high-value conversation intents
-            SLACK_INTENTS = ("positive", "positive_clarification", "clarifying_doubts", "want_top_candidates")
+            # Send Slack notification for high-value intents and negative intent triage.
+            SLACK_INTENTS = (
+                "positive",
+                "positive_clarification",
+                "clarifying_doubts",
+                "want_top_candidates",
+                "non_relevant",
+            )
             if intent_obj and intent_val in SLACK_INTENTS:
                 try:
                     from services.slack_notify_service import notify_intent_event
                     notify_intent_event(convo_id, intent_val, profile_name, actual_profile_url)
                 except Exception as slack_err:
                     logger.error(f"Failed to trigger Slack notification for convo {convo_id}: {slack_err}")
+
+            NEGATIVE_INTENTS = ("non_relevant",)
+            if intent_obj and intent_val in NEGATIVE_INTENTS:
+                negative_reply = "Thanks for confirming"
+                msg_id = save_message(
+                    ConversationMessage(
+                        conversation_id=convo_id,
+                        sender_type="bot",
+                        direction="outbound",
+                        message_type="text",
+                        content_text=negative_reply,
+                        delivery_status=DeliveryStatus.PENDING,
+                        context_source="linkedin_inbox.inbox_scraper.negative_intent_reply",
+                    )
+                )
+                sent_ok, _ = _fill_and_send_message(driver, negative_reply)
+                if sent_ok:
+                    update_message_delivery_status(msg_id, DeliveryStatus.SENT)
+                    logger.info(
+                        "Negative-intent fixed reply sent conversation_id=%s intent=%s message_id=%s",
+                        convo_id,
+                        intent_val,
+                        msg_id,
+                    )
+                else:
+                    logger.error(
+                        "Negative-intent fixed reply failed conversation_id=%s intent=%s message_id=%s",
+                        convo_id,
+                        intent_val,
+                        msg_id,
+                    )
 
             # Trigger auto-reply for specific intents (note: 'want_top_candidates' is Slack-only now)
             REPLY_INTENTS = ("neutral", "positive_clarification", "clarifying_doubts")
